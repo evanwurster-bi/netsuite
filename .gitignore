@@ -1,0 +1,18 @@
+.aws-sam
+/scripts
+.env.bestimpressions
+.env.duvall
+.env.rockytop
+.samignore
+README.md
+generate_token.py
+lambda_layers/netsuite_dependencies/
+lambda_layers/netsuite_dependencies/requirements.txt
+lambda_layers/netsuite_dependencies/setup.py
+lambda_layers/netsuite_dependencies/setup.cfg
+lambda_layers/netsuite_dependencies/setup.py
+template.yaml
+*.local.txt
+.env*
+netsuite-oauth-credentials.local.txt
+/samconfig accounts
