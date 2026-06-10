@@ -4,7 +4,6 @@
 .env.duvall
 .env.rockytop
 .samignore
-README.md
 generate_token.py
 lambda_layers/netsuite_dependencies/
 lambda_layers/netsuite_dependencies/requirements.txt
