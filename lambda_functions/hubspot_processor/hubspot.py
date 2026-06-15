@@ -279,13 +279,37 @@ class HubSpotClient:
         url = f'{base_url}/objects/line_items/{line_item_id}/associations/deals'
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
-        
+
         deals = response.json().get('results', [])
         if deals:
             deal_id = deals[0]['id']
             return self.get_deal(deal_id, api_version)
-        
+
         return None
+
+    def get_line_item_deal_id(self, line_item_id: str, api_version: str = None) -> str | None:
+        """Return only the parent deal id for a line item (no deal fetch).
+
+        Used to resolve the per-deal lock key cheaply; ``get_line_item_deal`` fetches the
+        full deal and is used by the handlers that need its properties.
+        """
+        base_url = self._get_base_url(api_version)
+        url = f'{base_url}/objects/line_items/{line_item_id}/associations/deals'
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+
+        deals = response.json().get('results', [])
+        return str(deals[0]['id']) if deals else None
+
+    def get_payment_deal_id(self, payment_id: str, api_version: str = None) -> str | None:
+        """Return only the parent deal id for a payment (no deal fetch). See get_line_item_deal_id."""
+        base_url = self._get_base_url(api_version)
+        url = f'{base_url}/objects/commerce_payments/{payment_id}/associations/deals'
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+
+        deals = response.json().get('results', [])
+        return str(deals[0]['id']) if deals else None
     
     def get_deal_contacts(self, deal_id: str, api_version: str = None) -> List[Dict[str, Any]]:
         """Fetch the contacts associated with a deal."""
@@ -344,10 +368,21 @@ class HubSpotClient:
         # Extract relevant fields from HubSpot deal
         properties = hubspot_deal.get('properties', {})
         
-        # event_start_date_and_time 2025-08-01T12:30:00Z format, convert to datetime
-        event_start = datetime.strptime(properties.get('event_start_date_and_time'), '%Y-%m-%dT%H:%M:%SZ')
-        event_start = event_start.replace(tzinfo=timezone.utc)
-        event_start_str = event_start.strftime('%Y-%m-%d')
+        # event_start_date_and_time is "2025-08-01T12:30:00Z"; convert to a NetSuite date.
+        # Guard against a missing/malformed value so one bad deal can't crash the sync —
+        # tranDate is simply omitted (NetSuite defaults to the current date).
+        raw_event_start = properties.get('event_start_date_and_time')
+        event_start_str = None
+        if raw_event_start:
+            try:
+                event_start = datetime.strptime(raw_event_start, '%Y-%m-%dT%H:%M:%SZ')
+                event_start_str = event_start.replace(tzinfo=timezone.utc).strftime('%Y-%m-%d')
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid event_start_date_and_time=%r on deal %s; omitting tranDate",
+                    raw_event_start,
+                    hubspot_deal.get('id'),
+                )
 
         # HubSpot deal event_type → NetSuite cseg_nsm_order_type (customrecord_cseg_nsm_order_type IDs).
         # Only types that exist in the segment Values tab are mapped; others omit cseg on the invoice.
@@ -370,7 +405,6 @@ class HubSpotClient:
                 'id': netsuite_customer_subsidiary_id,
             },
             'tranId': hubspot_deal.get('id'),
-            'tranDate': event_start_str,
             'custbody_hs_deal_id': hubspot_deal.get('id'),
             'custbody_hs_deal_name': properties.get('dealname', ''),
             'memo': properties.get('dealname', ''),
@@ -382,6 +416,8 @@ class HubSpotClient:
                 'items': []
             }
         }
+        if event_start_str:
+            netsuite_invoice['tranDate'] = event_start_str
         if segment_order_type:
             netsuite_invoice['cseg_nsm_order_type'] = segment_order_type
         production_fee = properties.get('production_fee')

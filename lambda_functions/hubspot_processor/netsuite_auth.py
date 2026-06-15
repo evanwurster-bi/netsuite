@@ -21,6 +21,20 @@ def _netsuite_path_for_log(url: str) -> str:
     return url
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a numeric ``Retry-After`` header (seconds); HTTP-date form is ignored.
+
+    Clamped to [0, 60] so a hostile or oversized value cannot stall the worker.
+    """
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(seconds, 60.0))
+
+
 def _unescape_pem_line_breaks(s: str) -> str:
     """Turn literal ``\\n`` / ``\\r`` (as stored in env or YAML) into real newlines; repeat for double-escaped values."""
     for _ in range(8):
@@ -83,6 +97,10 @@ class NetSuiteAuth:
             f"https://{self.account_id}.suitetalk.api.netsuite.com/services/rest"
         )
 
+        # Cached OAuth access token, reused across warm invocations until near expiry.
+        self._access_token: Optional[str] = None
+        self._access_token_expiry: float = 0.0
+
         raw_cert = os.environ.get("NETSUITE_CERT_STRING", "").strip()
         pem_bytes = _pem_private_key_bytes_from_cert_string(raw_cert)
 
@@ -113,7 +131,16 @@ class NetSuiteAuth:
         return str(token)
 
     def get_access_token(self) -> str:
-        """OAuth 2.0 client_credentials + jwt-bearer (identical flow to ``generate_token.py``)."""
+        """OAuth 2.0 client_credentials + jwt-bearer, with a cached token.
+
+        The token is cached on the instance and reused until ~60s before expiry. The
+        processor keeps a module-level ``NetSuiteAuth``, so the cache survives across warm
+        Lambda invocations and avoids minting a JWT and a token call on every request.
+        """
+        now = time.time()
+        if self._access_token and now < self._access_token_expiry - 60:
+            return self._access_token
+
         assertion = self._generate_jwt()
         response = requests.post(
             self.token_url,
@@ -125,13 +152,17 @@ class NetSuiteAuth:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         response.raise_for_status()
-        return response.json()["access_token"]
+        payload = response.json()
+        self._access_token = payload["access_token"]
+        self._access_token_expiry = now + float(payload.get("expires_in", 3600))
+        return self._access_token
 
     def make_request(self, method: str, endpoint: str, data: Optional[Dict] = None, additional_headers: Optional[Dict] = None, params: Optional[Dict] = None) -> requests.Response:
         """Make an authenticated request to NetSuite API with retries for rate limiting."""
         max_retries = 3
         retry_delay = 2  # Initial delay in seconds
         attempt = 0
+        response: Optional[requests.Response] = None
 
         while attempt < max_retries:
             try:
@@ -181,11 +212,21 @@ class NetSuiteAuth:
                     response.raise_for_status()
                     return response
 
-                # Handle rate limiting
+                # Handle rate limiting: honor Retry-After when present, else exponential backoff.
                 attempt += 1
                 if attempt < max_retries:
-                    # Exponential backoff
-                    sleep_time = retry_delay * (2 ** (attempt - 1))
+                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                    sleep_time = (
+                        retry_after
+                        if retry_after is not None
+                        else retry_delay * (2 ** (attempt - 1))
+                    )
+                    logger.info(
+                        "[NetSuite] 429 backoff %.1fs (retry %s/%s)",
+                        sleep_time,
+                        attempt,
+                        max_retries,
+                    )
                     time.sleep(sleep_time)
                     continue
 
@@ -197,11 +238,15 @@ class NetSuiteAuth:
                 attempt += 1
                 time.sleep(retry_delay * (2 ** (attempt - 1)))
 
+        if response is None:
+            raise RuntimeError(f"NetSuite request {method} {endpoint} produced no response")
         return response
     
     def get_customer_by_email(self, email: str) -> Dict[str, Any]:
         """Get customer by email."""
-        response = self.make_request('GET', 'record/v1/customer', {'q': f'email IS "{email}"'})
+        # Escape double quotes so an odd address can't break or inject into the q filter.
+        safe_email = str(email or "").replace('"', '\\"')
+        response = self.make_request('GET', 'record/v1/customer', {'q': f'email IS "{safe_email}"'})
         items = response.json().get('items', [])
         if items:
             return items[0]
@@ -224,8 +269,14 @@ class NetSuiteAuth:
         )
         return response.json().get('items', [])
     
-    def create_or_update_invoice(self, netsuite_invoice: Dict[str, Any], invoice_id: str = None) -> Dict[str, Any]:
-        """Create or update invoice in NetSuite."""
+    def create_or_update_invoice(self, netsuite_invoice: Dict[str, Any], invoice_id: str = None) -> bool:
+        """Create or update an invoice, keyed by externalId (the HubSpot deal id).
+
+        Idempotency safeguard: if a concurrent worker created the invoice between the
+        caller's existence check and this POST, NetSuite rejects the duplicate externalId.
+        We recover by re-resolving the invoice by externalId and patching it instead of
+        creating a second one.
+        """
         ext = str(netsuite_invoice.get("externalId", ""))
         if invoice_id:
             response = self.make_request(
@@ -235,13 +286,29 @@ class NetSuiteAuth:
                 params={"replace": "item"},
             )
             logger.info("[NetSuite] Invoice PATCH id=%s externalId=%s -> %s", invoice_id, ext, response.status_code)
-        else:
-            response = self.make_request("POST", "record/v1/invoice", netsuite_invoice)
-            logger.info("[NetSuite] Invoice POST externalId=%s -> %s", ext, response.status_code)
+            return response.status_code in (200, 201, 204)
 
-        if response.status_code in (200, 201, 204):
-            return True
-        return False
+        try:
+            response = self.make_request("POST", "record/v1/invoice", netsuite_invoice)
+        except requests.exceptions.HTTPError:
+            existing_id = self.get_invoice_by_deal_id(ext) if ext else None
+            if not existing_id:
+                raise
+            logger.warning(
+                "[NetSuite] Invoice POST failed but externalId=%s already exists (id=%s); patching instead",
+                ext,
+                existing_id,
+            )
+            response = self.make_request(
+                "PATCH",
+                f"record/v1/invoice/{existing_id}",
+                netsuite_invoice,
+                params={"replace": "item"},
+            )
+            return response.status_code in (200, 201, 204)
+
+        logger.info("[NetSuite] Invoice POST externalId=%s -> %s", ext, response.status_code)
+        return response.status_code in (200, 201, 204)
     
     def get_invoice_by_deal_id(self, deal_id: str) -> str:
         """Get invoice by deal ID."""
@@ -357,35 +424,41 @@ class NetSuiteAuth:
             return items[0]
         return None
     
-    def get_or_create_venue(self, venue_name: str, venue_external_id: str) -> str:
-        
+    def get_or_create_venue(self, venue_name: str, venue_external_id: str) -> Dict[str, Any]:
+        """Resolve a NetSuite location by name, creating it or back-filling its externalId.
+
+        Always returns the resolved location dict, or raises — it never returns ``None``, so
+        callers can safely read ``.get('id')``.
+        """
         venue_by_name = self.get_venue_by_name(venue_name)
         if venue_by_name:
-            if venue_by_name.get('externalId') == None:
-                body = {
-                    "name": venue_name,
-                    "externalId": venue_external_id
-                }
-                creation_response = self.create_or_update_venue(body, venue_by_name.get('id'))
-                if creation_response.get('success'):
-                    return self.get_venue_by_external_id(venue_external_id)
-            elif venue_by_name.get('externalId') == venue_external_id:
+            existing_external_id = venue_by_name.get('externalId')
+            if existing_external_id is None:
+                # Location exists without an externalId; back-fill it so future lookups match.
+                self.create_or_update_venue(
+                    {"name": venue_name, "externalId": venue_external_id},
+                    venue_by_name.get('id'),
+                )
+                resolved = self.get_venue_by_external_id(venue_external_id)
+                if not resolved:
+                    raise Exception(f"Failed to back-fill externalId for venue {venue_name}")
+                return resolved
+            if existing_external_id == venue_external_id:
                 return venue_by_name
-            else:
-                raise Exception(f"Venue with name {venue_name} already exists with external ID {venue_by_name.get('externalId')}, but the external ID is not the same as the one provided: {venue_external_id}")
-        
-        body = {
+            raise Exception(
+                f"Venue with name {venue_name} already exists with external ID "
+                f"{existing_external_id}, which differs from the provided {venue_external_id}"
+            )
+
+        self.create_or_update_venue({
             "name": venue_name,
             "externalId": venue_external_id,
-            "subsidiary": {
-                "items":[
-                    {"id":self.subsidiary_id}
-                ]
-            }
-        }
-        creation_response = self.create_or_update_venue(body)
-        if creation_response.get('success'):
-            return self.get_venue_by_external_id(venue_external_id)
+            "subsidiary": {"items": [{"id": self.subsidiary_id}]},
+        })
+        resolved = self.get_venue_by_external_id(venue_external_id)
+        if not resolved:
+            raise Exception(f"Failed to create venue {venue_name}")
+        return resolved
     
     def create_or_update_venue(self, netsuite_venue: Dict[str, Any], venue_id: str = None) -> Dict[str, Any]:
         """Create or update venue in NetSuite."""

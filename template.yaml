@@ -56,6 +56,30 @@ Parameters:
   NetSuiteSubsidiaryId:
     Type: String
 
+  ProcessorMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 1000
+    Description: Maximum concurrent ProcessorFunction invocations from SQS (caps shared NetSuite load).
+
+  ApiCallDelaySeconds:
+    Type: String
+    Default: "0.5"
+    Description: Padding (seconds) between HubSpot/NetSuite API calls in the processor; set "0" to disable.
+
+  HubSpotSignatureVerificationEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      When "true", the webhook verifies HubSpot v3 signatures and rejects unsigned/stale
+      requests. Requires the "hubspot_client_secret" key in the account's Secrets Manager
+      secret. Keep "false" until that secret key is provisioned.
+
+Conditions:
+  SignatureVerificationOn: !Equals [!Ref HubSpotSignatureVerificationEnabled, "true"]
+
 Resources:
 
   # ---------------------------
@@ -74,6 +98,44 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt HubSpotWebhookDLQ.Arn
         maxReceiveCount: 5
+
+  # Alarm when any message lands in the DLQ (failed after maxReceiveCount retries).
+  HubSpotWebhookDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-webhook-dlq-not-empty'
+      AlarmDescription: One or more HubSpot webhook messages have landed in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt HubSpotWebhookDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ---------------------------
+  # Per-deal sync lock (DynamoDB)
+  # ---------------------------
+  # Serializes processing per parent deal so concurrent deal/line-item/payment events
+  # never reconcile the same invoice at the same time. TTL releases a stale lock if a
+  # Lambda dies mid-process. Used by the processor starting in Phase 2.
+  SyncLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: deal_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: deal_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
 
   # ---------------------------
   # Lambda layer (Python dependencies)
@@ -107,6 +169,13 @@ Resources:
       Environment:
         Variables:
           SQS_QUEUE_URL: !Ref HubSpotWebhookQueue
+          HUBSPOT_SIGNATURE_VERIFICATION_ENABLED: !Ref HubSpotSignatureVerificationEnabled
+          # Resolved from Secrets Manager only when verification is on, so deploys succeed
+          # before the "hubspot_client_secret" key exists in the secret.
+          HUBSPOT_CLIENT_SECRET: !If
+            - SignatureVerificationOn
+            - !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:hubspot_client_secret}}"
+            - !Ref "AWS::NoValue"
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt HubSpotWebhookQueue.QueueName
@@ -146,6 +215,11 @@ Resources:
           NETSUITE_CERT_ID: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_id}}"
           NETSUITE_SUBSIDIARY_ID: !Ref NetSuiteSubsidiaryId
           NETSUITE_CERT_STRING: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_string}}"
+          SYNC_LOCK_TABLE: !Ref SyncLockTable
+          API_CALL_DELAY_SECONDS: !Ref ApiCallDelaySeconds
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SyncLockTable
       Events:
         Queue:
           Type: SQS
@@ -153,6 +227,10 @@ Resources:
             Queue: !GetAtt HubSpotWebhookQueue.Arn
             BatchSize: 5
             MaximumBatchingWindowInSeconds: 0
+            ScalingConfig:
+              MaximumConcurrency: !Ref ProcessorMaxConcurrency
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
 Outputs:
   WebhookUrl:

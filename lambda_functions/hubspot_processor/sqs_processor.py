@@ -19,6 +19,7 @@ from config import (
     HUBSPOT_VENUE_NETSUITE_ID_PROPERTY,
 )
 from hubspot import HubSpotClient
+from locks import deal_lock
 from netsuite_auth import NetSuiteAuth
 
 logger = logging.getLogger(__name__)
@@ -49,9 +50,17 @@ VENUE_CATEGORY_TO_NETSUITE: Dict[str, str] = {
 }
 
 
+# Padding between API calls to ease rate-limit pressure. Configurable (set to 0 to disable)
+# now that 429s are retried with Retry-After and processor concurrency is capped.
+# NOTE: this is NOT the read-after-write wait used after invoice writes — those explicit
+# time.sleep(1) calls stay, because NetSuite's externalId search is eventually consistent.
+_API_CALL_DELAY_SECONDS = float(os.getenv("API_CALL_DELAY_SECONDS", "0.5"))
+
+
 def _sleep_between_api_calls() -> None:
-    """Small delay to reduce HubSpot / NetSuite rate-limit pressure."""
-    time.sleep(0.5)
+    """Optional delay between API calls to ease rate-limit pressure (API_CALL_DELAY_SECONDS)."""
+    if _API_CALL_DELAY_SECONDS > 0:
+        time.sleep(_API_CALL_DELAY_SECONDS)
 
 
 def _now_hubspot_datetime_ms() -> str:
@@ -258,13 +267,26 @@ def process_deal_lineitems_change(
 
 
 def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
-    """Create or update a NetSuite invoice from a HubSpot deal webhook."""
+    """Validate a deal webhook, then reconcile its NetSuite invoice."""
+    is_valid, error_message, deal_id = hubspot.validate_webhook_payload(webhook_data)
+    if not is_valid:
+        logger.error("Invalid webhook payload: %s", error_message)
+        return False
+    return reconcile_deal_invoice(deal_id)
+
+
+def reconcile_deal_invoice(deal_id: str) -> bool:
+    """Build and upsert the NetSuite invoice for *deal_id* from current HubSpot state.
+
+    Idempotent: it re-reads the deal and all of its line items, so any trigger (deal change,
+    line-item change, or a retry) converges to the same invoice. Creates the invoice if it
+    is absent and updates it if it exists.
+
+    Returns ``True`` when handled (synced, or a recorded business rejection) and ``False``
+    for a permanent rejection. Transient errors propagate so the caller can retry.
+    """
     try:
-        logger.info("process_deal_to_invoice: validating payload")
-        is_valid, error_message, deal_id = hubspot.validate_webhook_payload(webhook_data)
-        if not is_valid:
-            logger.error("Invalid webhook payload: %s", error_message)
-            return False
+        logger.info("reconcile_deal_invoice: deal_id=%s", deal_id)
         _sleep_between_api_calls()
 
         def _set_invoice_status(reason: str) -> None:
@@ -296,7 +318,7 @@ def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
         allowed_subsidiary_ids = {
             str(row.get("subsidiary")) for row in customer_subsidiaries
         }
-        logger.info(
+        logger.debug(
             "[subsidiary-debug] customer_id=%s deploy_subsidiary=%s allowed_subsidiaries=%s relationships=%s",
             netsuite_customer_id,
             NETSUITE_SUBSIDIARY_ID,
@@ -446,7 +468,7 @@ def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
             )
         ).strip()
         
-        logger.info("hubspot_venue: %s", hubspot_venue)
+        logger.debug("hubspot_venue: %s", hubspot_venue)
         netsuite_venue = netsuite.get_or_create_venue(hubspot_venue_name, hubspot_venue.get("id"))
         netsuite_venue_id = netsuite_venue.get("id")
 
@@ -490,15 +512,23 @@ def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
             netsuite_line_items,
         )
 
-        logger.info("netsuite_invoice: %s", netsuite_invoice)
+        logger.debug("netsuite_invoice: %s", netsuite_invoice)
         if netsuite_sales_rep_id:
             netsuite_invoice["salesrep"] = {"id": int(netsuite_sales_rep_id)}
 
         netsuite_invoice["shipAddress"] = hubspot_venue_address
 
-        netsuite.create_or_update_invoice(netsuite_invoice, netsuite_invoice_id)
+        # The invoice upsert is the last NetSuite commit. Only stamp success on the deal
+        # once it is confirmed; transient failures raise (caller retries) rather than
+        # leaving the deal marked "created" with no invoice. Earlier steps (venue) are
+        # idempotent on externalId, so a retry re-converges instead of needing rollback.
+        if not netsuite.create_or_update_invoice(netsuite_invoice, netsuite_invoice_id):
+            raise RuntimeError(f"Invoice upsert did not succeed for deal {deal_id}")
         time.sleep(1)
         created_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+        if not created_invoice_id:
+            # Read-after-write lag or a failed write; retry will find or recreate it.
+            raise RuntimeError(f"Invoice not found after upsert for deal {deal_id}")
         netsuite_invoice_number = netsuite.get_invoice_number(created_invoice_id)
         invoice_status = "Invoice Modified" if existing_invoice_number else "Invoice created"
         hubspot.update_deal_properties(
@@ -518,8 +548,8 @@ def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
         return True
 
     except Exception:
-        logger.exception("process_deal_to_invoice failed")
-        return False
+        logger.exception("reconcile_deal_invoice failed for deal %s", deal_id)
+        raise
 
 
 def process_payment(webhook_data: Dict[str, Any]) -> bool:
@@ -599,18 +629,22 @@ def process_payment(webhook_data: Dict[str, Any]) -> bool:
         if payment_properties.get("hs_payment_date"):
             netsuite_payment["tranDate"] = payment_properties["hs_payment_date"]
 
-        netsuite.create_or_update_payment(netsuite_payment, netsuite_payment_id)
+        payment_result = netsuite.create_or_update_payment(netsuite_payment, netsuite_payment_id)
+        if not payment_result.get("success"):
+            raise RuntimeError(
+                f"Payment upsert did not succeed for {payment_id}: {payment_result.get('message')}"
+            )
         _sleep_between_api_calls()
 
         if not netsuite.get_payment_by_hubspot_id(payment_id):
-            logger.error("NetSuite payment not found after upsert: %s", payment_id)
-            return False
+            # Read-after-write lag or a failed write; retry rather than ack as permanent.
+            raise RuntimeError(f"NetSuite payment not found after upsert: {payment_id}")
 
         return True
 
     except Exception:
         logger.exception("process_payment failed")
-        return False
+        raise
 
 
 def process_venue(webhook_data: Dict[str, Any]) -> bool:
@@ -692,22 +726,28 @@ def process_venue(webhook_data: Dict[str, Any]) -> bool:
             created = netsuite.get_venue_by_external_id(venue_id)
             netsuite_venue_id = created.get("id") if created else None
 
-        if result.get("success") and netsuite_venue_id:
-            try:
-                hubspot.update_venue_properties(
-                    venue_id,
-                    {HUBSPOT_VENUE_NETSUITE_ID_PROPERTY: str(netsuite_venue_id)},
-                )
-                logger.info("Updated HubSpot venue %s with NetSuite id %s", venue_id, netsuite_venue_id)
-            except Exception:
-                logger.exception("Failed to push NetSuite id to HubSpot venue %s", venue_id)
+        if not result.get("success") or not netsuite_venue_id:
+            raise RuntimeError(
+                f"Venue upsert did not succeed for HubSpot venue {venue_id} "
+                f"(success={result.get('success')}, netsuite_id={netsuite_venue_id})"
+            )
+
+        # Write the NetSuite id back to HubSpot. Consistent with the invoice writeback: a
+        # failure here raises so the message redrives, instead of acking with the
+        # back-reference missing. Re-running is safe — the venue upsert is idempotent on
+        # externalId and setting the property is idempotent.
+        hubspot.update_venue_properties(
+            venue_id,
+            {HUBSPOT_VENUE_NETSUITE_ID_PROPERTY: str(netsuite_venue_id)},
+        )
+        logger.info("Updated HubSpot venue %s with NetSuite id %s", venue_id, netsuite_venue_id)
 
         logger.info("Venue sync finished: %s", result)
         return True
 
     except Exception:
         logger.exception("process_venue failed")
-        return False
+        raise
 
 
 def process_line_item(webhook_data: Dict[str, Any]) -> bool:
@@ -743,8 +783,12 @@ def process_line_item(webhook_data: Dict[str, Any]) -> bool:
         deal_id = hubspot_deal.get("id")
         netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
         if not netsuite_invoice_id:
-            logger.error("No NetSuite invoice for deal %s", deal_id)
-            return False
+            logger.info(
+                "[line_item] - No NetSuite invoice yet for deal %s; lines will sync when the "
+                "deal invoice is created",
+                deal_id,
+            )
+            return True
 
         hubspot_deal_line_items = hubspot.get_deal_line_items(deal_id)
         hubspot_line_items: List[Dict[str, Any]] = []
@@ -779,15 +823,71 @@ def process_line_item(webhook_data: Dict[str, Any]) -> bool:
 
     except Exception:
         logger.exception("process_line_item failed")
-        return False
+        raise
+
+
+def _resolve_lock_key(webhook_data: Dict[str, Any]) -> Optional[str]:
+    """Resolve the serialization key for an event: the parent deal id, or a venue key.
+
+    Every event that touches the same NetSuite invoice must share a key so they never run
+    concurrently. Line-item and payment events resolve to their parent deal; venue events
+    use a ``venue:<id>`` key (locations are shared in NetSuite, not per-deal).
+    """
+    subscription_type = webhook_data.get("subscriptionType", "")
+    object_id = str(webhook_data.get("objectId", "")).strip()
+    if not object_id:
+        return None
+
+    if _is_venue_event(webhook_data):
+        return f"venue:{object_id}"
+
+    if subscription_type in ("deal.creation", "deal.propertyChange"):
+        return object_id
+
+    if subscription_type in (
+        "line_item.creation",
+        "line_item.propertyChange",
+        "line_item.deletion",
+    ):
+        return hubspot.get_line_item_deal_id(object_id)
+
+    if subscription_type in ("object.creation", "object.propertyChange"):
+        object_type = webhook_data.get("objectTypeId")
+        if object_type == HUBSPOT_OBJECT_TYPE_PAYMENT:
+            return hubspot.get_payment_deal_id(object_id)
+        if object_type in HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS:
+            return hubspot.get_line_item_deal_id(object_id)
+
+    return object_id
 
 
 def process_webhook_message(webhook_data: Dict[str, Any]) -> bool:
-    """Route a single HubSpot webhook payload to the right handler."""
+    """Serialize per parent deal, then route the event to the right handler.
+
+    The per-deal lock guarantees concurrent deal / line-item / payment events for the same
+    invoice run one at a time which, together with the reconcile-from-state handlers,
+    prevents duplicate invoices and NetSuite "Record has been changed" errors. If the lock
+    is held by another worker, ``deal_lock`` raises and the SQS message is retried later.
+    """
     is_venue_event = _is_venue_event(webhook_data)
     if not is_venue_event and not _should_process_object_id(webhook_data):
         return True
 
+    lock_key = _resolve_lock_key(webhook_data)
+    if not lock_key:
+        logger.info(
+            "No parent deal resolved for objectId=%s subscriptionType=%s; skipping",
+            webhook_data.get("objectId"),
+            webhook_data.get("subscriptionType"),
+        )
+        return True
+
+    with deal_lock(lock_key):
+        return _dispatch_webhook_message(webhook_data)
+
+
+def _dispatch_webhook_message(webhook_data: Dict[str, Any]) -> bool:
+    """Route a single HubSpot webhook payload to the right handler (lock already held)."""
     subscription_type = webhook_data.get("subscriptionType", "")
 
     if subscription_type in ("deal.propertyChange", "deal.creation"):
@@ -821,47 +921,48 @@ def process_webhook_message(webhook_data: Dict[str, Any]) -> bool:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """SQS trigger: process one batch of webhook messages."""
-    try:
-        logger.info("SQS records: %s", len(event.get("Records", [])))
-        success_count = 0
-        failure_count = 0
+    """SQS trigger: process a batch and report per-message failures.
 
-        for record in event.get("Records", []):
-            try:
-                message_body = json.loads(record["body"])
-                items = message_body if isinstance(message_body, list) else [message_body]
-                for item in items:
-                    logger.info(
-                        "HubSpot webhook payload: %s",
-                        json.dumps(item, separators=(",", ":"), default=str),
-                    )
-                    if process_webhook_message(item):
-                        success_count += 1
-                    else:
-                        failure_count += 1
-            except Exception:
-                logger.exception(
-                    "Failed record messageId=%s",
-                    record.get("messageId", "unknown"),
+    Returns a ``batchItemFailures`` list (the ``ReportBatchItemFailures`` contract). Only
+    the message ids reported here are redriven by SQS; everything else is deleted.
+
+    Retry policy — three explicit outcomes, easy to spot in the code and in the logs:
+
+    * handler returns ``True``  -> success or intentional skip -> acked, no log noise.
+    * handler returns ``False`` -> permanent business rejection (e.g. no billing contact)
+      -> acked (retrying cannot help) but logged loudly as ``[rejected] ...`` and recorded
+      on the deal via ``netsuite_invoice_status``, so it is visible immediately.
+    * processing raises         -> transient error (lock contention, NetSuite 5xx, network)
+      -> reported in ``batchItemFailures`` so SQS redrives it, reaching the DLQ if it persists.
+    """
+    records = event.get("Records", [])
+    logger.info("SQS records: %s", len(records))
+    batch_item_failures: List[Dict[str, str]] = []
+
+    for record in records:
+        message_id = record.get("messageId", "unknown")
+        try:
+            message_body = json.loads(record["body"])
+            items = message_body if isinstance(message_body, list) else [message_body]
+            for item in items:
+                logger.debug(
+                    "HubSpot webhook payload: %s",
+                    json.dumps(item, separators=(",", ":"), default=str),
                 )
-                failure_count += 1
+                if not process_webhook_message(item):
+                    # Permanent business rejection (bad/missing data, no contact, …): ACK it —
+                    # retrying cannot help — but log it loudly so it is immediately visible.
+                    # The handler also records the reason on the deal (netsuite_invoice_status).
+                    logger.warning(
+                        "[rejected] acked without sync objectId=%s subscriptionType=%s",
+                        item.get("objectId"),
+                        item.get("subscriptionType"),
+                    )
+        except Exception:
+            logger.exception("[retry] transient failure messageId=%s", message_id)
+            batch_item_failures.append({"itemIdentifier": message_id})
 
-        logger.info("Batch done: success=%s failure=%s", success_count, failure_count)
-        return {
-            "statusCode": 200,
-            "body": json.dumps(
-                {
-                    "message": "Processing complete",
-                    "success_count": success_count,
-                    "failure_count": failure_count,
-                }
-            ),
-        }
-
-    except Exception as e:
-        logger.exception("lambda_handler failed: %s", e)
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error", "message": str(e)}),
-        }
+    logger.info(
+        "Batch done: records=%s failures=%s", len(records), len(batch_item_failures)
+    )
+    return {"batchItemFailures": batch_item_failures}

@@ -7,8 +7,17 @@
 # Versioned application files
 !template.yaml
 !README.md
+!RELIABILITY.md
 !.gitignore
 !.env.example
+
+# Documentation
+!docs/
+!docs/**
+
+# Tests
+!tests/
+!tests/**
 
 # Lambda source
 !lambda_functions/
@@ -39,3 +48,7 @@ private_key.pem
 netsuite-oauth-credentials.local.txt
 *-credentials.local.txt
 **/secrets.json
+
+# Compiled Python bytecode (even under allowlisted source dirs)
+__pycache__/
+*.pyc
