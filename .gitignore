@@ -1,17 +1,41 @@
-.aws-sam
-/scripts
-.env.bestimpressions
-.env.duvall
-.env.rockytop
-.samignore
+# Track only the application source and SAM template.
+# See README.md for the full list of versioned paths.
+
+# Ignore everything at the repository root
+*
+
+# Versioned application files
+!template.yaml
+!README.md
+!.gitignore
+!.env.example
+
+# Lambda source
+!lambda_functions/
+!lambda_functions/**
+
+# Shared dependencies layer
+!lambda_layers/
+!lambda_layers/**
+
+# Per-account SAM deploy config (non-secret settings only; no parameter_overrides)
+!samconfig accounts/
+!samconfig accounts/**
+
+# --- Secrets and local-only files (never commit) ---
+.env
+.env.*
+!.env.example
+
+# AWS SAM build output
+.aws-sam/
+
+# Local credentials, keys, and helper scripts
+scripts/
 generate_token.py
-lambda_layers/netsuite_dependencies/
-lambda_layers/netsuite_dependencies/requirements.txt
-lambda_layers/netsuite_dependencies/setup.py
-lambda_layers/netsuite_dependencies/setup.cfg
-lambda_layers/netsuite_dependencies/setup.py
-template.yaml
-*.local.txt
-.env*
+*.pem
+*.key
+private_key.pem
 netsuite-oauth-credentials.local.txt
-/samconfig accounts
+*-credentials.local.txt
+**/secrets.json

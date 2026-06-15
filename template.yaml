@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: HubSpot webhooks via SQS to NetSuite (SAM)
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures:
+      - x86_64
+
+Parameters:
+  SecretName:
+    Type: String
+    Description: >-
+      AWS Secrets Manager secret id (name or ARN) holding the account credentials.
+      Expected JSON keys: hubspot_api_key, netsuite_client_id, netsuite_cert_id, netsuite_cert_string.
+
+  HubSpotDealStageSyncId:
+    Type: String
+    Default: "1233582150"
+    Description: HubSpot deal stage internal ID(s) that trigger NetSuite invoice sync for dealstage webhooks. Comma-separated list allowed.
+
+  HubSpotObjectTypeVenue:
+    Type: String
+    Default: "2-47163024"
+    Description: HubSpot custom object type ID for venues (webhook objectTypeId).
+
+  HubSpotObjectTypePayment:
+    Type: String
+    Default: "0-101"
+    Description: HubSpot commerce payment object type ID (webhook objectTypeId).
+
+  HubSpotObjectTypeLineItem:
+    Type: String
+    Default: "0-8"
+    Description: HubSpot line item object type ID for webhooks (0-8 is standard CRM; 0-102 is also accepted at runtime).
+
+  DealVenueNameProperty:
+    Type: String
+    Default: "venue_name_"
+    Description: HubSpot deal property internal name used to resolve venue name for invoice sync.
+
+  WebhookObjectIdFilterEnabled:
+    Type: String
+    Default: "false"
+    Description: When true, process only webhook events with objectId included in WebhookObjectIdFilterValue (comma-separated list supported).
+
+  WebhookObjectIdFilterValue:
+    Type: String
+    Default: "59370061459"
+    Description: HubSpot objectId allowlist used when webhook objectId filter is enabled (comma-separated).
+
+  NetSuiteAccountId:
+    Type: String
+
+  NetSuiteSubsidiaryId:
+    Type: String
+
+Resources:
+
+  # ---------------------------
+  # SQS queues
+  # ---------------------------
+  HubSpotWebhookDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  HubSpotWebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 960
+      ReceiveMessageWaitTimeSeconds: 0
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt HubSpotWebhookDLQ.Arn
+        maxReceiveCount: 5
+
+  # ---------------------------
+  # Lambda layer (Python dependencies)
+  # ---------------------------
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: python3.14
+      BuildArchitecture: x86_64
+    Properties:
+      LayerName: netsuite-dependencies
+      Description: Python dependencies for NetSuite integration
+      ContentUri: lambda_layers/netsuite_dependencies/
+      CompatibleRuntimes:
+        - python3.14
+
+  # ---------------------------
+  # WEBHOOK FUNCTION
+  # ---------------------------
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-webhook'
+      Description: Receives HubSpot webhooks and enqueues payloads to SQS
+      CodeUri: lambda_functions/hubspot_webhook/
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref HubSpotWebhookQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt HubSpotWebhookQueue.QueueName
+      Events:
+        HubSpotWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /hubspot/webhook
+            Method: POST
+
+  # ---------------------------
+  # PROCESSOR FUNCTION
+  # ---------------------------
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processor'
+      Description: Consumes SQS messages and syncs HubSpot data to NetSuite
+      CodeUri: lambda_functions/hubspot_processor/
+      Handler: sqs_processor.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          HUBSPOT_API_KEY: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:hubspot_api_key}}"
+          HUBSPOT_DEAL_STAGE_SYNC_ID: !Ref HubSpotDealStageSyncId
+          HUBSPOT_OBJECT_TYPE_VENUE: !Ref HubSpotObjectTypeVenue
+          HUBSPOT_OBJECT_TYPE_PAYMENT: !Ref HubSpotObjectTypePayment
+          HUBSPOT_OBJECT_TYPE_LINE_ITEM: !Ref HubSpotObjectTypeLineItem
+          DEAL_VENUE_NAME_PROPERTY: !Ref DealVenueNameProperty
+          WEBHOOK_OBJECT_ID_FILTER_ENABLED: !Ref WebhookObjectIdFilterEnabled
+          WEBHOOK_OBJECT_ID_FILTER_VALUE: !Ref WebhookObjectIdFilterValue
+          NETSUITE_ACCOUNT_ID: !Ref NetSuiteAccountId
+          NETSUITE_CLIENT_ID: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_client_id}}"
+          NETSUITE_CERT_ID: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_id}}"
+          NETSUITE_SUBSIDIARY_ID: !Ref NetSuiteSubsidiaryId
+          NETSUITE_CERT_STRING: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_string}}"
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt HubSpotWebhookQueue.Arn
+            BatchSize: 5
+            MaximumBatchingWindowInSeconds: 0
+
+Outputs:
+  WebhookUrl:
+    Description: HTTPS endpoint for HubSpot (POST)
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/hubspot/webhook'
+
+  WebhookQueueUrl:
+    Value: !Ref HubSpotWebhookQueue
+
+  WebhookFunctionArn:
+    Value: !GetAtt WebhookFunction.Arn
+
+  ProcessorFunctionArn:
+    Value: !GetAtt ProcessorFunction.Arn

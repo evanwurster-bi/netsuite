@@ -1,0 +1,21 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "hs-netsuite-sandbox-bestimpressions"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "hs-netsuite-sandbox-bestimpressions"
+profile = "dev-cetdigit"
+disable_rollback = true
+# Secrets (HubSpot token + NetSuite client id / cert id / private key) live in AWS Secrets Manager.
+# Only the secret name and non-sensitive config are stored here.
+parameter_overrides = "SecretName=\"hs-netsuite/sandbox/bestimpressions\" HubSpotDealStageSyncId=\"1059843170\" HubSpotObjectTypeVenue=\"2-47363405\" HubSpotObjectTypePayment=\"0-101\" HubSpotObjectTypeLineItem=\"0-8\" DealVenueNameProperty=\"venu_name_sync\" WebhookObjectIdFilterEnabled=\"false\" WebhookObjectIdFilterValue=\"60177497455\" NetSuiteAccountId=\"3763009-sb1\" NetSuiteSubsidiaryId=\"2\""
+image_repositories = []
