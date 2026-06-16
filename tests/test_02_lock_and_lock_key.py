@@ -45,6 +45,22 @@ def test_release_does_not_steal_a_newer_lock(fake_lock_table):
     assert fake_lock_table.items["deal-1"]["owner"] == "B"
 
 
+def test_release_aliases_reserved_keyword_owner(monkeypatch):
+    # "owner" is a DynamoDB reserved keyword: the ConditionExpression must use an alias
+    # (#owner) via ExpressionAttributeNames, or DynamoDB raises ValidationException and the
+    # lock is never released (held until TTL). Guards against reverting to the bare word.
+    captured = {}
+
+    class CapturingTable:
+        def delete_item(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(locks, "_table", CapturingTable())
+    locks._release("deal-1", "tok")
+    assert "#owner" in captured["ConditionExpression"]  # aliased, not the bare reserved word
+    assert captured["ExpressionAttributeNames"] == {"#owner": "owner"}
+
+
 # --- Lock-key resolution (scenario 04: parent/child share one key) -------------------------
 
 def test_deal_event_locks_on_its_own_id():
