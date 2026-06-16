@@ -42,19 +42,29 @@ if the read-after-write lagged, masking the real state.
 
 ## After — confirm, then retry idempotently
 
-The upsert result is checked and the invoice re-resolved **before** stamping the deal; any
-failure (including the writeback) **raises**, so the message redrives and the whole reconcile
-re-runs. Because every step is idempotent, the retry converges.
+The upsert result is checked **before** stamping the deal, and the new invoice id comes
+straight from the write response — not a follow-up `externalId` search — so a genuine failure
+raises (→ retry) while a just-created invoice is never mistaken for "missing". Because every
+step is idempotent, the retry converges.
 
 ```python
-if not netsuite.create_or_update_invoice(netsuite_invoice, netsuite_invoice_id):
-    raise RuntimeError(...)                       # don't stamp success on a failed upsert
-created_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+# Returns the internal id from the write response (Location header / known id) — NOT an
+# eventually-consistent externalId search. Falsy only on a real non-success -> raise.
+created_invoice_id = netsuite.create_or_update_invoice(netsuite_invoice, netsuite_invoice_id)
 if not created_invoice_id:
-    raise RuntimeError(...)                       # read-after-write lag → retry
-netsuite_invoice_number = netsuite.get_invoice_number(created_invoice_id)
-hubspot.update_deal_properties(deal_id, {...})    # raises on failure → redrive
+    raise RuntimeError(...)                       # real failure -> retry
+netsuite_invoice_number = netsuite.get_invoice_number(created_invoice_id)  # direct GET, consistent
+hubspot.update_deal_properties(deal_id, {...})    # raises on failure -> redrive
 ```
+
+> **Why not re-search by `externalId` here?** That search is *eventually consistent*. An
+> earlier version verified the write by searching and raised if it came back empty — but right
+> after a create the search index often hasn't caught up, so it raised on a perfectly good
+> invoice and left the (already-processed) SQS message redriving forever: **"processed but
+> always in flight."** Reading the id from the `Location` header is strongly consistent and
+> avoids that trap. Where a search read-back is unavoidable (payments, venue create without a
+> `Location`), `_read_back` retries briefly and then acks with a loud `[rejected]` log rather
+> than looping.
 
 ```mermaid
 sequenceDiagram
@@ -85,11 +95,14 @@ sequenceDiagram
   Redriving it once HubSpot recovers safely completes the writeback (reconcile is idempotent).
 
 ### The same guarantee for payments and venues
-- **Payments** (`process_payment`): the upsert result is checked and "payment not found after
-  upsert" is treated as **retryable** (read-after-write lag), not acked as permanent.
-- **Venues** (`process_venue`): the NetSuite-id back-reference write to HubSpot now **raises**
-  on failure (previously it was logged and swallowed), so it redrives like the invoice
-  writeback. Re-running is safe — the location upsert is idempotent on `externalId`.
+- **Payments** (`process_payment`): the *write* result is checked (a real failure raises →
+  retry); the existence verification afterwards uses `_read_back` (bounded retry for search
+  lag) and, if the payment still isn't visible after a confirmed-success write, acks with a
+  loud `[rejected]` log instead of looping.
+- **Venues** (`process_venue`): the location id is taken from the write response; the
+  HubSpot back-reference write **raises** on failure so it redrives (re-running is safe — the
+  location upsert and the property write are both idempotent). If only the id can't be
+  resolved after a successful write, it acks and defers the back-reference to a later event.
 
 ### Residual notes
 There is a brief eventual-consistency window between the successful NetSuite write and a

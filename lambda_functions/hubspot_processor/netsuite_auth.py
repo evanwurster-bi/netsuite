@@ -35,6 +35,23 @@ def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     return max(0.0, min(seconds, 60.0))
 
 
+def _id_from_location(response: Optional[requests.Response]) -> Optional[str]:
+    """Extract the new record's internal id from a NetSuite create response.
+
+    NetSuite returns the id in the ``Location`` header (``.../record/v1/<type>/<id>``) on a
+    successful create. Reading it from the response is strongly consistent — unlike the
+    ``externalId`` search — so it is the reliable way to learn a just-created record's id
+    without waiting for the search index to catch up.
+    """
+    if response is None:
+        return None
+    location = (response.headers or {}).get("Location", "")
+    if not location:
+        return None
+    candidate = location.rstrip("/").rsplit("/", 1)[-1].strip()
+    return candidate or None
+
+
 def _unescape_pem_line_breaks(s: str) -> str:
     """Turn literal ``\\n`` / ``\\r`` (as stored in env or YAML) into real newlines; repeat for double-escaped values."""
     for _ in range(8):
@@ -269,13 +286,17 @@ class NetSuiteAuth:
         )
         return response.json().get('items', [])
     
-    def create_or_update_invoice(self, netsuite_invoice: Dict[str, Any], invoice_id: str = None) -> bool:
+    def create_or_update_invoice(self, netsuite_invoice: Dict[str, Any], invoice_id: str = None) -> Optional[str]:
         """Create or update an invoice, keyed by externalId (the HubSpot deal id).
 
-        Idempotency safeguard: if a concurrent worker created the invoice between the
-        caller's existence check and this POST, NetSuite rejects the duplicate externalId.
-        We recover by re-resolving the invoice by externalId and patching it instead of
-        creating a second one.
+        Returns the NetSuite **internal id** on success and ``None`` on a non-success status.
+        The id comes from the known ``invoice_id`` on update, or from the create response's
+        ``Location`` header — never from a follow-up ``externalId`` search, which is
+        eventually consistent and would make a just-created invoice look missing.
+
+        Idempotency safeguard: if a concurrent worker created the invoice between the caller's
+        existence check and this POST, NetSuite rejects the duplicate externalId; we recover
+        by re-resolving the invoice by externalId and patching it instead of duplicating.
         """
         ext = str(netsuite_invoice.get("externalId", ""))
         if invoice_id:
@@ -286,7 +307,7 @@ class NetSuiteAuth:
                 params={"replace": "item"},
             )
             logger.info("[NetSuite] Invoice PATCH id=%s externalId=%s -> %s", invoice_id, ext, response.status_code)
-            return response.status_code in (200, 201, 204)
+            return str(invoice_id) if response.status_code in (200, 201, 204) else None
 
         try:
             response = self.make_request("POST", "record/v1/invoice", netsuite_invoice)
@@ -305,10 +326,13 @@ class NetSuiteAuth:
                 netsuite_invoice,
                 params={"replace": "item"},
             )
-            return response.status_code in (200, 201, 204)
+            return str(existing_id) if response.status_code in (200, 201, 204) else None
 
         logger.info("[NetSuite] Invoice POST externalId=%s -> %s", ext, response.status_code)
-        return response.status_code in (200, 201, 204)
+        if response.status_code not in (200, 201, 204):
+            return None
+        # Prefer the strongly-consistent Location id; fall back to search only if absent.
+        return _id_from_location(response) or self.get_invoice_by_deal_id(ext)
     
     def get_invoice_by_deal_id(self, deal_id: str) -> str:
         """Get invoice by deal ID."""
@@ -461,7 +485,12 @@ class NetSuiteAuth:
         return resolved
     
     def create_or_update_venue(self, netsuite_venue: Dict[str, Any], venue_id: str = None) -> Dict[str, Any]:
-        """Create or update venue in NetSuite."""
+        """Create or update venue in NetSuite.
+
+        On success the result includes the location's internal ``id`` (the known id on
+        update, or the create response's ``Location`` id) so callers don't have to re-search
+        by externalId — which is eventually consistent right after a write.
+        """
         if venue_id:
             # Update existing venue
             response = self.make_request('PATCH', f'record/v1/location/{venue_id}', netsuite_venue)
@@ -469,12 +498,13 @@ class NetSuiteAuth:
             # Create new venue
             response = self.make_request('POST', 'record/v1/location', netsuite_venue)
 
-        if response.status_code == 204:
-            return {'success': True, 'message': 'Venue updated successfully'}       
-        elif response.status_code == 201:
-            return {'success': True, 'message': 'Venue created successfully'}
-        else:
-            return {'success': False, 'message': f'Venue operation failed with status {response.status_code}'}
+        if response.status_code in (200, 201, 204):
+            return {
+                'success': True,
+                'message': 'Venue created/updated successfully',
+                'id': str(venue_id) if venue_id else _id_from_location(response),
+            }
+        return {'success': False, 'message': f'Venue operation failed with status {response.status_code}'}
         
 
     

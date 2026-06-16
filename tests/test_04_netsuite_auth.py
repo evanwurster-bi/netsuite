@@ -71,6 +71,31 @@ def test_expired_token_refreshes(monkeypatch):
 
 # --- externalId collision recovery (scenario 03) -------------------------------------------
 
+def test_create_returns_location_id(monkeypatch):
+    # The new record id comes from the strongly-consistent Location header, not a search.
+    auth = na.NetSuiteAuth()
+
+    class Resp:
+        status_code = 204
+        headers = {
+            "Location": "https://acct.suitetalk.api.netsuite.com/services/rest/record/v1/invoice/98765"
+        }
+
+    monkeypatch.setattr(auth, "make_request", lambda *a, **k: Resp())
+    assert auth.create_or_update_invoice({"externalId": "123"}) == "98765"
+
+
+def test_update_returns_known_id(monkeypatch):
+    auth = na.NetSuiteAuth()
+
+    class Resp:
+        status_code = 204
+        headers = {}
+
+    monkeypatch.setattr(auth, "make_request", lambda *a, **k: Resp())
+    assert auth.create_or_update_invoice({"externalId": "123"}, invoice_id="42") == "42"
+
+
 def test_create_collision_recovers_with_patch(monkeypatch):
     auth = na.NetSuiteAuth()
     seq = []
@@ -78,6 +103,7 @@ def test_create_collision_recovers_with_patch(monkeypatch):
     class Resp:
         def __init__(self, code):
             self.status_code = code
+            self.headers = {}
 
     def fake_make_request(method, endpoint, data=None, additional_headers=None, params=None):
         seq.append((method, endpoint))
@@ -88,10 +114,10 @@ def test_create_collision_recovers_with_patch(monkeypatch):
     monkeypatch.setattr(auth, "make_request", fake_make_request)
     monkeypatch.setattr(auth, "get_invoice_by_deal_id", lambda ext: "555")
 
-    ok = auth.create_or_update_invoice({"externalId": "123"})
-    assert ok is True
+    result_id = auth.create_or_update_invoice({"externalId": "123"})
+    assert result_id == "555"  # recovered: returns the existing invoice id
     assert ("POST", "record/v1/invoice") in seq
-    assert ("PATCH", "record/v1/invoice/555") in seq  # recovered instead of duplicating
+    assert ("PATCH", "record/v1/invoice/555") in seq  # patched instead of duplicating
 
 
 def test_create_collision_reraises_if_no_existing(monkeypatch):
@@ -108,3 +134,11 @@ def test_create_collision_reraises_if_no_existing(monkeypatch):
         assert False, "should have re-raised"
     except requests.exceptions.HTTPError:
         pass
+
+
+def test_id_from_location_parsing():
+    class Resp:
+        headers = {"Location": "https://x/services/rest/record/v1/invoice/12345/"}
+
+    assert na._id_from_location(Resp()) == "12345"
+    assert na._id_from_location(type("R", (), {"headers": {}})()) is None

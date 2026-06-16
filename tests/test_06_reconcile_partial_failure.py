@@ -82,7 +82,8 @@ class FakeNetSuite:
     def create_or_update_invoice(self, invoice, invoice_id=None):
         self.create_calls += 1
         self.invoice_exists = True  # NetSuite committed
-        return self.upsert_ok
+        # Returns the internal id (from the write response) on success, None on failure.
+        return "inv-1" if self.upsert_ok else None
 
     def get_invoice_number(self, invoice_id):
         return "INV-1001"
@@ -132,3 +133,28 @@ def test_failed_upsert_raises_before_stamping(wired):
     with pytest.raises(RuntimeError):
         sp.reconcile_deal_invoice("123")
     assert fake_hs.writeback_calls == 0  # never stamped "Invoice created" on a failed upsert
+
+
+def test_search_index_lag_does_not_stick_the_message(wired, monkeypatch):
+    # Reproduces the "processed but always in flight" bug: the externalId search NEVER catches
+    # up after the write. Because the invoice id now comes from the write response, reconcile
+    # still completes (the message would be acked/deleted, not redriven forever).
+    fake_hs, fake_ns = wired
+    monkeypatch.setattr(fake_ns, "get_invoice_by_deal_id", lambda deal_id: None)
+    assert sp.reconcile_deal_invoice("123") is True
+    assert fake_hs.writeback_calls == 1
+
+
+def test_read_back_retries_then_succeeds(no_sleep):
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        return "found" if calls["n"] >= 3 else None
+
+    assert sp._read_back(fetch, attempts=5, delay=0) == "found"
+    assert calls["n"] == 3
+
+
+def test_read_back_gives_up_and_returns_none(no_sleep):
+    assert sp._read_back(lambda: None, attempts=3, delay=0) is None
