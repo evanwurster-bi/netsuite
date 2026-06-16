@@ -63,6 +63,23 @@ def _sleep_between_api_calls() -> None:
         time.sleep(_API_CALL_DELAY_SECONDS)
 
 
+def _read_back(fetch, *, attempts: int = 5, delay: float = 1.0):
+    """Retry an eventually-consistent NetSuite ``externalId`` search after a write.
+
+    The search index can lag a freshly written record by a few seconds, so a single read
+    right after a create may return nothing even though the record exists. Used only where we
+    cannot get the id straight from the write response.
+    """
+    result = None
+    for attempt in range(attempts):
+        result = fetch()
+        if result:
+            return result
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    return result
+
+
 def _now_hubspot_datetime_ms() -> str:
     """Current UTC time as a HubSpot datetime value (epoch milliseconds)."""
     return str(int(datetime.now(timezone.utc).timestamp() * 1000))
@@ -518,17 +535,15 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
 
         netsuite_invoice["shipAddress"] = hubspot_venue_address
 
-        # The invoice upsert is the last NetSuite commit. Only stamp success on the deal
-        # once it is confirmed; transient failures raise (caller retries) rather than
-        # leaving the deal marked "created" with no invoice. Earlier steps (venue) are
-        # idempotent on externalId, so a retry re-converges instead of needing rollback.
-        if not netsuite.create_or_update_invoice(netsuite_invoice, netsuite_invoice_id):
-            raise RuntimeError(f"Invoice upsert did not succeed for deal {deal_id}")
-        time.sleep(1)
-        created_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+        # The invoice upsert is the last NetSuite commit. We take the internal id straight
+        # from the upsert response (Location header / known id) instead of re-searching by
+        # externalId, because that search is eventually consistent and would otherwise make a
+        # just-created invoice look "missing" and wrongly redrive the (already processed)
+        # message. A genuine non-success returns a falsy id and raises (transient -> retry).
+        created_invoice_id = netsuite.create_or_update_invoice(netsuite_invoice, netsuite_invoice_id)
         if not created_invoice_id:
-            # Read-after-write lag or a failed write; retry will find or recreate it.
-            raise RuntimeError(f"Invoice not found after upsert for deal {deal_id}")
+            raise RuntimeError(f"Invoice upsert did not succeed for deal {deal_id}")
+        # Direct GET by internal id is strongly consistent, so no read-back lag here.
         netsuite_invoice_number = netsuite.get_invoice_number(created_invoice_id)
         invoice_status = "Invoice Modified" if existing_invoice_number else "Invoice created"
         hubspot.update_deal_properties(
@@ -631,14 +646,18 @@ def process_payment(webhook_data: Dict[str, Any]) -> bool:
 
         payment_result = netsuite.create_or_update_payment(netsuite_payment, netsuite_payment_id)
         if not payment_result.get("success"):
+            # The write itself failed -> transient; let it redrive.
             raise RuntimeError(
                 f"Payment upsert did not succeed for {payment_id}: {payment_result.get('message')}"
             )
-        _sleep_between_api_calls()
 
-        if not netsuite.get_payment_by_hubspot_id(payment_id):
-            # Read-after-write lag or a failed write; retry rather than ack as permanent.
-            raise RuntimeError(f"NetSuite payment not found after upsert: {payment_id}")
+        # The upsert succeeded; the verification search is eventually consistent, so retry it
+        # a few times. If it still can't be seen, the payment exists anyway — ack with a loud
+        # log instead of looping the message in flight.
+        if not _read_back(lambda: netsuite.get_payment_by_hubspot_id(payment_id)):
+            logger.warning(
+                "[rejected] payment %s upserted but not yet visible via search; acking", payment_id
+            )
 
         return True
 
@@ -722,20 +741,31 @@ def process_venue(webhook_data: Dict[str, Any]) -> bool:
             netsuite_venue_id = netsuite_venue.get("id")
         else:
             result = netsuite.create_or_update_venue(netsuite_venue_data)
-            time.sleep(0.5)
-            created = netsuite.get_venue_by_external_id(venue_id)
-            netsuite_venue_id = created.get("id") if created else None
+            # Prefer the id from the write response; fall back to the eventually-consistent
+            # search only if the Location header was absent.
+            netsuite_venue_id = result.get("id")
+            if not netsuite_venue_id:
+                created = _read_back(lambda: netsuite.get_venue_by_external_id(venue_id))
+                netsuite_venue_id = created.get("id") if created else None
 
-        if not result.get("success") or not netsuite_venue_id:
+        if not result.get("success"):
+            # The write itself failed -> transient; let it redrive.
             raise RuntimeError(
-                f"Venue upsert did not succeed for HubSpot venue {venue_id} "
-                f"(success={result.get('success')}, netsuite_id={netsuite_venue_id})"
+                f"Venue upsert did not succeed for HubSpot venue {venue_id}: {result.get('message')}"
             )
 
-        # Write the NetSuite id back to HubSpot. Consistent with the invoice writeback: a
-        # failure here raises so the message redrives, instead of acking with the
-        # back-reference missing. Re-running is safe — the venue upsert is idempotent on
-        # externalId and setting the property is idempotent.
+        if not netsuite_venue_id:
+            # Venue is synced in NetSuite (write succeeded) but its id wasn't resolvable this
+            # run. Ack with a loud log and let a later venue event set the back-reference,
+            # rather than looping the message in flight.
+            logger.warning(
+                "[rejected] venue %s synced but id unresolved this run; back-reference deferred",
+                venue_id,
+            )
+            return True
+
+        # Write the NetSuite id back to HubSpot. A failure here raises so the message redrives;
+        # re-running is safe (venue upsert and the property write are both idempotent).
         hubspot.update_venue_properties(
             venue_id,
             {HUBSPOT_VENUE_NETSUITE_ID_PROPERTY: str(netsuite_venue_id)},

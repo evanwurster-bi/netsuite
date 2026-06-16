@@ -283,12 +283,19 @@ queue keyed by deal id.
 
 [`sqs_processor.py`](lambda_functions/hubspot_processor/sqs_processor.py)
 
-- **Confirm before stamping.** `reconcile_deal_invoice` now checks
-  `create_or_update_invoice`'s result and re-resolves the invoice **before** writing
-  `netsuite_invoice_status`. A non-success upsert or a missing post-write invoice **raises**
+- **Confirm before stamping.** `reconcile_deal_invoice` checks `create_or_update_invoice`'s
+  result **before** writing `netsuite_invoice_status`; a non-success upsert **raises**
   (→ retry) instead of marking the deal "Invoice created" with no invoice behind it.
-- **Payments**: `process_payment` checks the upsert result and treats "payment not found
-  after upsert" as **retryable** (read-after-write lag) rather than acking it as permanent.
+- **Take the new id from the write response, not a search.** `create_or_update_invoice` and
+  `create_or_update_venue` return the record's internal id read from the create response's
+  `Location` header (strongly consistent), and `get_invoice_number` then does a direct GET by
+  id. We no longer re-search by `externalId` right after a write — that search is *eventually
+  consistent*, so the old "verify by search then raise if missing" logic made a just-created
+  record look missing, raised, and left the (already-processed) SQS message redriving forever
+  — "processed but always in flight." Where a search read-back is still unavoidable
+  (payments, a venue create without a `Location`), `_read_back` retries a few times and, if
+  the record still isn't visible after a confirmed-success write, acks with a loud
+  `[rejected]` log instead of looping.
 - **Rollback strategy = idempotent reconcile.** NetSuite REST has no multi-record
   transaction, so we rely on ordering + idempotency instead: the invoice upsert is the last
   commit, and earlier steps (venue/location) are keyed on `externalId`, so a retry
