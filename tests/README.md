@@ -44,8 +44,8 @@ Run SQS + DynamoDB locally and drive `lambda_handler` against them to verify the
 
 Deploy an **independent** sandbox stack and validate against real HubSpot/NetSuite sandboxes:
 
-1. `sam validate --lint && sam build && sam deploy --config-file "samconfig accounts/samconfig.duvall.toml"`
-   (ideally a *separate* stack name so you can compare old vs. new side by side).
+1. `sam validate --lint && sam build && sam deploy --config-file "samconfig accounts/reliability/duvall.toml"`
+   (parallel `-reliability` stack; see `samconfig accounts/README.md`).
 2. **Batch (01):** POST a webhook body containing an array of several events → confirm one SQS
    message per event and all syncs applied.
 3. **Retry/DLQ (02):** point at an invalid NetSuite cred briefly (or force a 5xx) → confirm the

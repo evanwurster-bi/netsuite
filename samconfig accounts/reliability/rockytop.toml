@@ -1,0 +1,21 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "hs-netsuite-sandbox-rockytop-reliability"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "hs-netsuite-sandbox-rockytop-reliability"
+profile = "dev-cetdigit"
+disable_rollback = true
+# Parallel reliability test stack. Reuses the Rocky Top secret in Secrets Manager.
+# Only the secret name and non-sensitive config are stored here.
+parameter_overrides = "SecretName=\"hs-netsuite/sandbox/rockytop\" HubSpotDealStageSyncId=\"1208741443\" HubSpotObjectTypeVenue=\"2-52267420\" HubSpotObjectTypePayment=\"0-101\" HubSpotObjectTypeLineItem=\"0-8\" DealVenueNameProperty=\"venue_name_\" WebhookObjectIdFilterEnabled=\"false\" WebhookObjectIdFilterValue=\"\" NetSuiteAccountId=\"3763009-sb1\" NetSuiteSubsidiaryId=\"5\""
+image_repositories = []

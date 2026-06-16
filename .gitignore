@@ -48,15 +48,12 @@ private_key.pem
 netsuite-oauth-credentials.local.txt
 *-credentials.local.txt
 **/secrets.json
-<<<<<<< Updated upstream
 
 # Compiled Python bytecode (even under allowlisted source dirs)
 __pycache__/
 *.pyc
-=======
 secrets/
 **/secrets/
 secrets-accounts.json
 **/secrets-accounts.json
 **/*-secret.json
->>>>>>> Stashed changes

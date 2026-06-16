@@ -27,9 +27,15 @@ sandbox/
 ├── README.md
 ├── .env.example              # Template for local testing only
 ├── samconfig accounts/       # Per-account deploy config (non-secret)
-│   ├── samconfig.duvall.toml
-│   ├── samconfig.bestimpressions.toml
-│   └── samconfig.rockytop.toml
+│   ├── README.md
+│   ├── sandbox/              # Regular sandbox stacks
+│   │   ├── duvall.toml
+│   │   ├── bestimpressions.toml
+│   │   └── rockytop.toml
+│   └── reliability/          # Parallel stacks for reliability E2E validation
+│       ├── duvall.toml
+│       ├── bestimpressions.toml
+│       └── rockytop.toml
 ├── lambda_functions/         # Webhook + processor source
 │   ├── hubspot_webhook/
 │   └── hubspot_processor/
@@ -45,9 +51,12 @@ Each client maps to one SAM config and one secret:
 
 | Account | SAM config | Secrets Manager secret |
 |---------|------------|------------------------|
-| Duvall | `samconfig.duvall.toml` | `hs-netsuite/sandbox/duvall` |
-| Best Impressions | `samconfig.bestimpressions.toml` | `hs-netsuite/sandbox/bestimpressions` |
-| Rocky Top | `samconfig.rockytop.toml` | `hs-netsuite/sandbox/rockytop` |
+| Duvall | `samconfig accounts/sandbox/duvall.toml` | `hs-netsuite/sandbox/duvall` |
+| Best Impressions | `samconfig accounts/sandbox/bestimpressions.toml` | `hs-netsuite/sandbox/bestimpressions` |
+| Rocky Top | `samconfig accounts/sandbox/rockytop.toml` | `hs-netsuite/sandbox/rockytop` |
+
+Parallel reliability test stacks (same template, different stack name) live under
+`samconfig accounts/reliability/`. See [samconfig accounts/README.md](samconfig%20accounts/README.md).
 
 ## Credentials
 
@@ -122,8 +131,8 @@ sam validate
 sam validate --lint
 
 # Build and deploy per account
-sam build  --config-file "samconfig accounts/samconfig.duvall.toml"
-sam deploy --config-file "samconfig accounts/samconfig.duvall.toml"
+sam build  --config-file "samconfig accounts/sandbox/duvall.toml"
+sam deploy --config-file "samconfig accounts/sandbox/duvall.toml"
 ```
 
 Replace `duvall` with `bestimpressions` or `rockytop` for the other accounts.
