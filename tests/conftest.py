@@ -59,7 +59,13 @@ class FakeLockTable:
             raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
         self.items[key] = Item
 
-    def delete_item(self, Key, ConditionExpression=None, ExpressionAttributeValues=None):
+    def delete_item(
+        self,
+        Key,
+        ConditionExpression=None,
+        ExpressionAttributeNames=None,
+        ExpressionAttributeValues=None,
+    ):
         key = Key["deal_id"]
         cur = self.items.get(key)
         if cur and ExpressionAttributeValues and cur["owner"] != ExpressionAttributeValues[":token"]:

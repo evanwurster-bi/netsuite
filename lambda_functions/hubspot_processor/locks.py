@@ -58,7 +58,10 @@ def _release(key: str, token: str) -> None:
     try:
         _table.delete_item(
             Key={"deal_id": key},
-            ConditionExpression="owner = :token",
+            # "owner" is a DynamoDB reserved keyword, so it must be aliased via
+            # ExpressionAttributeNames; using it bare raises a ValidationException.
+            ConditionExpression="#owner = :token",
+            ExpressionAttributeNames={"#owner": "owner"},
             ExpressionAttributeValues={":token": token},
         )
     except ClientError as exc:
