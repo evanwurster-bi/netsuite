@@ -168,6 +168,11 @@ class NetSuiteAuth:
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+        if not response.ok:
+            # Surface NetSuite's reason (e.g. {"error":"invalid_client",...}) before raising —
+            # otherwise raise_for_status hides why the token request was rejected.
+            preview = (response.text or "")[:500].replace("\n", " ")
+            logger.error("[NetSuite] token request -> %s %s", response.status_code, preview)
         response.raise_for_status()
         payload = response.json()
         self._access_token = payload["access_token"]

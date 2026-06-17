@@ -34,6 +34,8 @@ def test_token_is_cached_across_calls(monkeypatch):
     calls = {"n": 0}
 
     class Resp:
+        ok = True
+
         def raise_for_status(self):
             pass
 
@@ -50,12 +52,44 @@ def test_token_is_cached_across_calls(monkeypatch):
     assert calls["n"] == 1  # second call served from cache
 
 
+def test_token_failure_logs_netsuite_reason(monkeypatch, caplog):
+    # On a non-2xx token response, the NetSuite error body must be logged before raising,
+    # so an auth failure (e.g. invalid_client) is diagnosable from CloudWatch.
+    auth = na.NetSuiteAuth()
+    monkeypatch.setattr(auth, "_generate_jwt", lambda: "jwt")
+
+    class Resp:
+        ok = False
+        status_code = 400
+        text = '{"error":"invalid_client","error_description":"bad cert"}'
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError("400")
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(na.requests, "post", lambda *a, **k: Resp())
+    with caplog.at_level("ERROR"):
+        try:
+            auth.get_access_token()
+            assert False, "should have raised"
+        except requests.exceptions.HTTPError:
+            pass
+    assert any(
+        "token request -> 400" in r.getMessage() and "invalid_client" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_expired_token_refreshes(monkeypatch):
     auth = na.NetSuiteAuth()
     monkeypatch.setattr(auth, "_generate_jwt", lambda: "jwt")
     calls = {"n": 0}
 
     class Resp:
+        ok = True
+
         def raise_for_status(self):
             pass
 
