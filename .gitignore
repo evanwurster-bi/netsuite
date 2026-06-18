@@ -1,59 +1,47 @@
-# Track only the application source and SAM template.
-# See README.md for the full list of versioned paths.
+# Whitelist-only repo: ignore everything, then un-ignore versioned paths.
+# See README.md.
 
-# Ignore everything at the repository root
 *
 
-# Versioned application files
 !template.yaml
 !README.md
 !RELIABILITY.md
 !.gitignore
+!.samignore
 !.env.example
 
-# Documentation
 !docs/
 !docs/**
 
-# Tests
 !tests/
 !tests/**
 
-# Lambda source
 !lambda_functions/
 !lambda_functions/**
 
-# Shared dependencies layer
 !lambda_layers/
 !lambda_layers/**
 
-# Per-account SAM deploy config (non-secret settings only; no parameter_overrides)
 !samconfig accounts/
 !samconfig accounts/**
 
-# --- Secrets and local-only files (never commit) ---
+# Local-only
 .env
 .env.*
 !.env.example
 
-# AWS SAM build output
-.aws-sam/
-
-# Local credentials, keys, and helper scripts
-scripts/
+certificates/
+secrets/
 generate_token.py
+
 *.pem
 *.key
+*.pfx
+*.p12
 private_key.pem
-netsuite-oauth-credentials.local.txt
-*-credentials.local.txt
-**/secrets.json
 
-# Compiled Python bytecode (even under allowlisted source dirs)
+.aws-sam/
+.venv/
+.pytest_cache/
 __pycache__/
 *.pyc
-secrets/
-**/secrets/
-secrets-accounts.json
-**/secrets-accounts.json
-**/*-secret.json

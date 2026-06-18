@@ -1,88 +1,73 @@
-# HubSpot → NetSuite Integration (AWS SAM)
+# HubSpot → NetSuite (Sandbox)
 
-Serverless integration that receives HubSpot webhooks, queues them in SQS, and synchronizes deals, venues, payments, and line items into NetSuite.
+AWS SAM application that receives HubSpot webhooks, buffers them in SQS, and syncs deals, venues, payments, and line items into NetSuite.
 
-The same codebase is deployed to multiple client accounts. Only application source and **non-secret** configuration are versioned. Credentials live in AWS Secrets Manager.
+One codebase is deployed per client account. **Application source and non-secret configuration are versioned in git.** All credentials live outside the repository (local files for development, AWS Secrets Manager for deployed Lambdas).
 
 ## Architecture
 
 ```text
-HubSpot → API Gateway (WebhookFunction) → SQS (HubSpotWebhookQueue) → Processor Lambda (ProcessorFunction) → NetSuite + HubSpot APIs
+HubSpot → API Gateway (WebhookFunction) → SQS → ProcessorFunction → NetSuite / HubSpot APIs
 ```
 
-| Resource | Responsibility |
-|----------|----------------|
-| `WebhookFunction` | Receives HubSpot webhooks and publishes to SQS |
-| `ProcessorFunction` | Applies business rules and syncs to NetSuite |
-| `HubSpotWebhookQueue` / `HubSpotWebhookDLQ` | Decoupling and failure isolation |
+| Component | Role |
+|-----------|------|
+| `WebhookFunction` | Accepts webhooks, enqueues payloads |
+| `ProcessorFunction` | Business rules and NetSuite sync |
+| `HubSpotWebhookQueue` / `HubSpotWebhookDLQ` | Async processing and failure isolation |
 | `DependenciesLayer` | Shared Python dependencies |
 
-## Repository structure
-
-Only these paths are tracked in git:
+## What is in git
 
 ```text
-sandbox/
-├── template.yaml              # SAM infrastructure + Lambda definitions
-├── README.md
-├── .env.example              # Template for local testing only
-├── samconfig accounts/       # Per-account deploy config (non-secret)
-│   ├── README.md
-│   ├── sandbox/              # Regular sandbox stacks
-│   │   ├── duvall.toml
-│   │   ├── bestimpressions.toml
-│   │   └── rockytop.toml
-│   └── reliability/          # Parallel stacks for reliability E2E validation
-│       ├── duvall.toml
-│       ├── bestimpressions.toml
-│       └── rockytop.toml
-├── lambda_functions/         # Webhook + processor source
-│   ├── hubspot_webhook/
-│   └── hubspot_processor/
-└── lambda_layers/            # Shared dependency layer
-    └── netsuite_dependencies/requirements.txt
+template.yaml
+README.md
+RELIABILITY.md
+.env.example
+docs/
+tests/
+lambda_functions/
+lambda_layers/
+samconfig accounts/
 ```
 
-Everything else (`.env*`, `.aws-sam/`, PEM/key files, local scripts) stays local and is ignored by git.
+Everything else is local or generated at build time and is excluded via `.gitignore` and `.samignore`.
 
-## Accounts
+## Client accounts
 
-Each client maps to one SAM config and one secret:
-
-| Account | SAM config | Secrets Manager secret |
-|---------|------------|------------------------|
+| Account | Deploy config | AWS secret |
+|---------|---------------|------------|
 | Duvall | `samconfig accounts/sandbox/duvall.toml` | `hs-netsuite/sandbox/duvall` |
 | Best Impressions | `samconfig accounts/sandbox/bestimpressions.toml` | `hs-netsuite/sandbox/bestimpressions` |
 | Rocky Top | `samconfig accounts/sandbox/rockytop.toml` | `hs-netsuite/sandbox/rockytop` |
 
-Parallel reliability test stacks (same template, different stack name) live under
-`samconfig accounts/reliability/`. See [samconfig accounts/README.md](samconfig%20accounts/README.md).
+Reliability / E2E stacks use the same template under `samconfig accounts/reliability/`. See [samconfig accounts/README.md](samconfig%20accounts/README.md).
 
 ## Credentials
 
-Credentials are **never** stored in the repository.
+### Deployed (AWS)
 
-| Type | Stored in | In git? |
-|------|-----------|---------|
-| HubSpot token, NetSuite client id / cert id / private key | AWS Secrets Manager | No |
-| Stack name, region, profile, object type ids, subsidiary, filters | `samconfig accounts/*.toml` | Yes (non-secret) |
+Each account has a secret in **AWS Secrets Manager**. `samconfig` passes only `SecretName`; `template.yaml` resolves values at deploy time:
 
-### How it works
+| Secret key | Lambda env var |
+|------------|----------------|
+| `hubspot_api_key` | `HUBSPOT_API_KEY` |
+| `netsuite_client_id` | `NETSUITE_CLIENT_ID` |
+| `netsuite_cert_id` | `NETSUITE_CERT_ID` |
+| `netsuite_cert_string` | `NETSUITE_CERT_STRING` |
 
-`samconfig` passes only a `SecretName` (plus non-secret config). `template.yaml` resolves the actual secret values from AWS Secrets Manager **at deploy time**:
+All three sandbox accounts share the same NetSuite OAuth integration; only the HubSpot token differs per secret.
 
-```yaml
-HUBSPOT_API_KEY:     !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:hubspot_api_key}}"
-NETSUITE_CLIENT_ID:  !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_client_id}}"
-NETSUITE_CERT_ID:    !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_id}}"
-NETSUITE_CERT_STRING:!Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_string}}"
+Update a secret (example — Duvall):
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id "hs-netsuite/sandbox/duvall" \
+  --secret-string file://path/to/secret.json \
+  --profile dev-cetdigit --region us-east-1
 ```
 
-CloudFormation reads the secret using the deploying AWS profile, so the deploying user needs `secretsmanager:GetSecretValue`. No secret value ever touches git.
-
-### Creating an account secret
-
-Each secret is a JSON document with these keys:
+Secret JSON shape:
 
 ```json
 {
@@ -93,90 +78,106 @@ Each secret is a JSON document with these keys:
 }
 ```
 
-Create it once per account (example for Duvall):
+After rotating credentials, redeploy or wait for new Lambda environments to pick up the updated secret.
 
-```bash
-aws secretsmanager create-secret \
-  --name "hs-netsuite/sandbox/duvall" \
-  --secret-string file://duvall-secret.json \
-  --profile dev-cetdigit --region us-east-1
+### Local development
+
+Credentials are read from fixed local paths (never committed):
+
+| Purpose | Path |
+|---------|------|
+| NetSuite OAuth (shared) | `secrets/netsuite-sandbox.json` |
+| NetSuite private key (P-256) | `certificates/private.pem` |
+| HubSpot tokens (per account) | `secrets/hubspot-accounts.json` |
+| HubSpot deploy settings | `.env.<account>` (object types, subsidiary, filters) |
+| Default account for CLI | `.env` → `SANDBOX_ACCOUNT=duvall` |
+
+`secrets/netsuite-sandbox.json`:
+
+```json
+{
+  "account_id": "3763009-sb1",
+  "client_id": "...",
+  "cert_id": "..."
+}
 ```
 
-Update an existing secret:
+`secrets/hubspot-accounts.json`:
 
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id "hs-netsuite/sandbox/duvall" \
-  --secret-string file://duvall-secret.json \
-  --profile dev-cetdigit --region us-east-1
+```json
+{
+  "duvall": { "hubspot_api_key": "pat-na1-..." },
+  "bestimpressions": { "hubspot_api_key": "pat-na1-..." },
+  "rockytop": { "hubspot_api_key": "pat-na1-..." }
+}
 ```
 
-> Keep the `*-secret.json` file local; it is ignored by git. Delete it after upload.
+Non-secret deploy parameters (subsidiary, HubSpot object type IDs, stage filters) live in `samconfig accounts/sandbox/*.toml`.
 
 ## Prerequisites
 
-- AWS SAM CLI
-- Python `3.14` (matches the template runtime)
-- AWS CLI profile with deploy + `secretsmanager:GetSecretValue` permissions
-- HubSpot private app token with required CRM scopes
-- NetSuite REST integration (OAuth 2.0 client credentials)
+- AWS SAM CLI, AWS CLI (profile with deploy + `secretsmanager:GetSecretValue`)
+- Python 3.14 (matches `template.yaml` runtime)
+- HubSpot private app token (CRM scopes)
+- NetSuite REST integration (OAuth 2.0 client credentials + EC P-256 certificate)
 
 ## Deploy
 
-Run from the `sandbox/` folder.
+From the `sandbox/` directory:
 
 ```bash
-# Validate
 sam validate
 sam validate --lint
 
-# Build and deploy per account
 sam build  --config-file "samconfig accounts/sandbox/duvall.toml"
 sam deploy --config-file "samconfig accounts/sandbox/duvall.toml"
 ```
 
-Replace `duvall` with `bestimpressions` or `rockytop` for the other accounts.
+Use `bestimpressions` or `rockytop` in place of `duvall` for the other accounts.
 
-## Local OAuth testing
+`sam build` packages only `lambda_functions/` and `lambda_layers/`; credentials, tests, and local tooling are excluded via `.samignore`.
+
+## Local verification
 
 ```bash
 pip install -r lambda_layers/netsuite_dependencies/requirements.txt
-cp .env.example .env   # fill in values locally
+
 python generate_token.py
+python generate_token.py --account rockytop
 ```
 
-Smoke test the webhook endpoint (`WebhookUrl` stack output):
+Webhook smoke test (`WebhookUrl` stack output):
 
 ```powershell
 Invoke-WebRequest -Uri "REPLACE_WITH_WebhookUrl" -Method POST -ContentType "application/json" `
   -Body '{"subscriptionType":"deal.propertyChange","objectId":"123","propertyName":"dealstage","propertyValue":"1233582150"}'
 ```
 
-Expected response: `204`.
+Expected: `204`.
 
 ## Business rules
 
-- **Invoice sync** runs only when `prior_netsuite_invoice = no` and the deal stage is in `HUBSPOT_DEAL_STAGE_SYNC_ID`.
-- **Billing contact**: HubSpot association label `Billing`, falling back to the first associated contact.
-- **Customer**: resolved in NetSuite by contact email.
-- **Subsidiary**: invoice subsidiary is always `NETSUITE_SUBSIDIARY_ID`; the customer's shared subsidiaries are read via SuiteQL (`customerSubsidiaryRelationship`). If the deploy subsidiary is not shared, the deal is rejected.
-- **Venue**: name comes from `DEAL_VENUE_NAME_PROPERTY`; resolved/created as a NetSuite `location`.
-- **Line items**: `hs_sku` → NetSuite `itemid`; SKU must start with `3`; `Owned Equipment` with `amount <= 0` is skipped.
+- Invoice sync when `prior_netsuite_invoice = no` and deal stage is in `HUBSPOT_DEAL_STAGE_SYNC_ID`.
+- Billing contact: HubSpot association label `Billing`, else first associated contact.
+- Customer: NetSuite lookup by contact email.
+- Subsidiary: always `NETSUITE_SUBSIDIARY_ID` from deploy config; customer must share that subsidiary.
+- Venue: from `DEAL_VENUE_NAME_PROPERTY` → NetSuite `location`.
+- Line items: `hs_sku` → NetSuite `itemid`; SKU must start with `3`; skip `Owned Equipment` with `amount <= 0`.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---------|--------------|
-| `Invalid Field Value ... location` | Subsidiary/location mismatch in NetSuite |
-| `Record has been changed` | Concurrent update on an existing invoice |
-| `NetSuite customer not found for email` | HubSpot contact email has no matching NetSuite customer |
-| `Customer ... is not assigned to subsidiary ...` | Deploy subsidiary not shared with the customer |
-| Deploy fails resolving the secret | Secret missing, wrong `SecretName`, or missing `secretsmanager:GetSecretValue` |
-| Invoice sync skipped | `HUBSPOT_DEAL_STAGE_SYNC_ID` empty (by design) |
+| Deploy fails on secret resolve | Missing secret, wrong `SecretName`, or no `GetSecretValue` permission |
+| `Invalid Field Value ... location` | Subsidiary / location mismatch in NetSuite |
+| `Record has been changed` | Concurrent invoice update |
+| `NetSuite customer not found for email` | No matching NetSuite customer |
+| Customer not assigned to subsidiary | Subsidiary not on customer record |
+| Invoice sync skipped | Empty `HUBSPOT_DEAL_STAGE_SYNC_ID` (by design) |
+| OAuth fails locally (`secp521r1`) | Private key must be P-256 for ES256 |
 
-## Security checklist
+## Security
 
-- [ ] No secrets in `samconfig accounts/*.toml` (only `SecretName` + non-secret config)
-- [ ] No secret values in `template.yaml` (only `{{resolve:secretsmanager:...}}` references)
-- [ ] `.env*`, PEM, and `*-secret.json` files never committed
-- [ ] Rotate any credential that was ever pushed to a remote
+- Do not commit `.env*`, `secrets/`, `certificates/`, or PEM files.
+- Do not put secret values in `samconfig` or `template.yaml`.
+- Rotate any credential that was ever exposed in a remote or shared channel.

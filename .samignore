@@ -1,0 +1,31 @@
+# Exclude from SAM build artifacts (Lambda deployment packages only).
+
+# Not runtime code
+tests/
+docs/
+samconfig accounts/
+generate_token.py
+
+# Credentials and local config
+certificates/
+secrets/
+.env
+.env.*
+
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Tooling / VCS / build cache
+.aws-sam/
+.git/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Docs not required in the bundle
+*.md
+
+push_sa

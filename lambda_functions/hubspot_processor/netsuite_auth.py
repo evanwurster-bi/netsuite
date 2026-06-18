@@ -94,7 +94,7 @@ def _pem_private_key_bytes_from_cert_string(raw: str) -> bytes:
     decoded = base64.b64decode(cleaned, validate=False)
     if b"-----BEGIN" not in decoded:
         raise ValueError(
-            "NETSUITE_CERT_STRING must be PEM (multiline, one line with \\n, or base64 PEM); run scripts/encode_pem_for_sam.py with scripts/private.pem."
+            "NETSUITE_CERT_STRING must be PEM (multiline, one line with \\n, or base64 PEM); use certificates/private.pem (P-256)."
         )
     return decoded
 

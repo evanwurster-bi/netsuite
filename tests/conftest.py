@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "lambda_functions" / "hubspot_processor"))
 sys.path.insert(0, str(ROOT / "lambda_functions" / "hubspot_webhook"))
 
 # Dummy env the modules read at import time. No real values / no network.
+os.environ["SANDBOX_LOCAL_CREDENTIALS"] = "skip"
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("NETSUITE_ACCOUNT_ID", "acct")
 os.environ.setdefault("NETSUITE_CLIENT_ID", "client")
