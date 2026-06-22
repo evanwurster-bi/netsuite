@@ -1,4 +1,4 @@
-"""SQS consumer: HubSpot webhook payloads to NetSuite (deals, invoices, payments, venues, line items)."""
+"""SQS consumer: HubSpot webhook payloads to NetSuite (deals, invoices, venues, line items)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from config import (
     DEAL_VENUE_NAME_PROPERTY,
@@ -18,7 +18,7 @@ from config import (
     HUBSPOT_OBJECT_TYPE_VENUE,
     HUBSPOT_VENUE_NETSUITE_ID_PROPERTY,
 )
-from hubspot import HubSpotClient
+from hubspot import DealInvoiceRejected, HubSpotClient
 from locks import deal_lock
 from netsuite_auth import NetSuiteAuth
 
@@ -49,18 +49,38 @@ VENUE_CATEGORY_TO_NETSUITE: Dict[str, str] = {
     "Controlled": "2",
 }
 
+_HUBSPOT_LINE_ITEM_PROPERTIES = (
+    "name",
+    "description",
+    "quantity",
+    "hs_sku",
+    "price",
+    "amount",
+    "subcategory",
+)
 
-# Padding between API calls to ease rate-limit pressure. Configurable (set to 0 to disable)
-# now that 429s are retried with Retry-After and processor concurrency is capped.
-# NOTE: this is NOT the read-after-write wait used after invoice writes — those explicit
-# time.sleep(1) calls stay, because NetSuite's externalId search is eventually consistent.
+
+# Configurable pause between HubSpot/NetSuite calls (see API_CALL_DELAY_SECONDS in template).
 _API_CALL_DELAY_SECONDS = float(os.getenv("API_CALL_DELAY_SECONDS", "0.5"))
 
 
 def _sleep_between_api_calls() -> None:
-    """Optional delay between API calls to ease rate-limit pressure (API_CALL_DELAY_SECONDS)."""
+    """Optional delay between HubSpot/NetSuite calls (API_CALL_DELAY_SECONDS)."""
     if _API_CALL_DELAY_SECONDS > 0:
         time.sleep(_API_CALL_DELAY_SECONDS)
+
+
+def _fetch_deal_line_item_details(deal_id: str) -> List[Dict[str, Any]]:
+    """One associations call + one batch read for all line items on a deal."""
+    association_rows = hubspot.get_deal_line_items(deal_id)
+    line_item_ids = [str(row["id"]) for row in association_rows if row.get("id")]
+    if not line_item_ids:
+        return []
+    _sleep_between_api_calls()
+    return hubspot.get_line_item_details_batch(
+        line_item_ids,
+        properties=list(_HUBSPOT_LINE_ITEM_PROPERTIES),
+    )
 
 
 def _read_back(fetch, *, attempts: int = 5, delay: float = 1.0):
@@ -94,10 +114,6 @@ def _set_deal_invoice_status(deal_id: str, status: str) -> None:
             "netsuite_invoice_last_modified_date": _now_hubspot_datetime_ms(),
         },
     )
-
-
-def get_netsuite_customer_by_email(email: str) -> Optional[Dict[str, Any]]:
-    return netsuite.get_customer_by_email(email)
 
 
 def _should_process_object_id(webhook_data: Dict[str, Any]) -> bool:
@@ -214,54 +230,103 @@ def _is_venue_event(webhook_data: Dict[str, Any]) -> bool:
     return False
 
 
+def _is_payment_webhook(webhook_data: Dict[str, Any]) -> bool:
+    if webhook_data.get("objectTypeId") == HUBSPOT_OBJECT_TYPE_PAYMENT:
+        return True
+    return webhook_data.get("subscriptionType", "") in (
+        "payment.creation",
+        "payment.propertyChange",
+    )
+
+
+def _parse_hubspot_line_item(
+    hubspot_line_item: Dict[str, Any],
+    skip_sub_category: str,
+) -> Tuple[str, str, float, Dict[str, Any], Optional[str]]:
+    """Parse HubSpot line props; return a skip reason or None if eligible for NetSuite lookup."""
+    props = hubspot_line_item.get("properties") or {}
+    current_sub_category = str(props.get("subcategory") or "").strip().lower()
+    hubspot_item_sku = str(props.get("hs_sku") or "").strip()
+    hubspot_item_name = str(props.get("name") or "").strip()
+    line_amount_raw = props.get("amount")
+    try:
+        line_amount = float(line_amount_raw or 0)
+    except (TypeError, ValueError):
+        line_amount = 0.0
+
+    if current_sub_category == skip_sub_category and line_amount <= 0:
+        return (
+            hubspot_item_sku,
+            hubspot_item_name,
+            line_amount,
+            props,
+            f"subcategory={HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY} amount<=0",
+        )
+
+    if not hubspot_item_sku.startswith("3"):
+        return (
+            hubspot_item_sku,
+            hubspot_item_name,
+            line_amount,
+            props,
+            "sku_missing_or_not_starting_with_3",
+        )
+
+    return hubspot_item_sku, hubspot_item_name, line_amount, props, None
+
+
 def process_deal_lineitems_change(
     hubspot_line_items: List[Dict[str, Any]],
 ) -> Union[List[Dict[str, Any]], bool]:
-    """
-    Build NetSuite invoice line payloads from HubSpot line items.
-    Returns a list of line dicts, or False on unexpected error.
-    """
+    """Map HubSpot lines to NetSuite invoice rows; filter locally before SKU lookups."""
     try:
-        logger.info("[lines] - Mapping %s HubSpot line item(s) to NetSuite", len(hubspot_line_items))
-        final_line_items: List[Dict[str, Any]] = []
+        total = len(hubspot_line_items)
+        logger.info("[lines] - Evaluating %s HubSpot line item(s)", total)
         skip_sub_category = str(HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY or "").strip().lower()
+        eligible: List[Tuple[str, str, float, Dict[str, Any]]] = []
+        skipped: List[Tuple[str, str, str]] = []
+        skip_counts: Dict[str, int] = {}
 
         for hubspot_line_item in hubspot_line_items:
-            props = hubspot_line_item.get("properties") or {}
-            # HubSpot internal name is "subcategory" for line items.
-            current_sub_category = str(props.get("subcategory") or "").strip().lower()
-            hubspot_item_sku = str(props.get("hs_sku") or "").strip()
-            hubspot_item_name = str(props.get("name") or "").strip()
-            line_amount_raw = props.get("amount")
-            try:
-                line_amount = float(line_amount_raw or 0)
-            except (TypeError, ValueError):
-                line_amount = 0
-
-            # Business rule: Owned Equipment with amount <= 0 should not be sent to NetSuite.
-            if current_sub_category == skip_sub_category and line_amount <= 0:
-                logger.info(
-                    "[lines] - Skip sub_category=%s amount=%s",
-                    HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY,
-                    line_amount,
-                )
+            sku, name, amount, props, skip_reason = _parse_hubspot_line_item(
+                hubspot_line_item,
+                skip_sub_category,
+            )
+            if skip_reason:
+                skipped.append((sku or "missing", name or "missing", skip_reason))
+                skip_counts[skip_reason] = skip_counts.get(skip_reason, 0) + 1
                 continue
+            eligible.append((sku, name, amount, props))
 
-            if hubspot_item_sku and not hubspot_item_sku.startswith("3"):
-                logger.info(
-                    "[lines] - Skip line item sku=%s name=%s (SKU must start with 3)",
-                    hubspot_item_sku,
-                    hubspot_item_name or "missing",
-                )
-                continue
+        logger.info(
+            "[lines] - Filter summary total=%s eligible=%s skipped=%s by_reason=%s",
+            total,
+            len(eligible),
+            len(skipped),
+            skip_counts,
+        )
+        for sku, name, skip_reason in skipped:
+            logger.info(
+                "[lines] - Skipped sku=%s name=%s reason=%s",
+                sku,
+                name,
+                skip_reason,
+            )
 
-            netsuite_item = netsuite.search_item_by_sku(hubspot_item_sku)
-            _sleep_between_api_calls()
+        final_line_items: List[Dict[str, Any]] = []
+        not_found = 0
+        unique_skus = list(dict.fromkeys(sku for sku, _, _, _ in eligible))
+        sku_to_item = netsuite.search_items_by_sku_batch(unique_skus)
+        _sleep_between_api_calls()
+
+        for hubspot_item_sku, hubspot_item_name, line_amount, props in eligible:
+            netsuite_item = sku_to_item.get(hubspot_item_sku)
 
             if not netsuite_item:
+                not_found += 1
                 logger.error(
                     "[lines] - NetSuite item not found for sku=%s name=%s",
-                    hubspot_item_sku or "missing",
+                    hubspot_item_sku,
                     hubspot_item_name or "missing",
                 )
                 continue
@@ -275,6 +340,14 @@ def process_deal_lineitems_change(
                 "rate": float(props.get("price") or 0),
             }
             final_line_items.append(line)
+
+        if not_found:
+            logger.info(
+                "[lines] - NetSuite lookup summary eligible=%s mapped=%s not_found=%s",
+                len(eligible),
+                len(final_line_items),
+                not_found,
+            )
 
         return final_line_items
 
@@ -321,7 +394,7 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
             _set_invoice_status("Not created: contact email missing")
             return False
 
-        netsuite_customer = get_netsuite_customer_by_email(email)
+        netsuite_customer = netsuite.get_customer_by_email(email)
         _sleep_between_api_calls()
         if not netsuite_customer:
             logger.error("NetSuite customer not found for email %s", email)
@@ -383,23 +456,7 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
             "netsuite_invoice_number", ""
         )
 
-        hubspot_deal_line_items = hubspot.get_deal_line_items(deal_id)
-        hubspot_deal_line_items_details: List[Dict[str, Any]] = []
-        for line_item in hubspot_deal_line_items:
-            _sleep_between_api_calls()
-            detail = hubspot.get_line_item_detail(
-                line_item.get("id"),
-                properties=[
-                    "name",
-                    "description",
-                    "quantity",
-                    "hs_sku",
-                    "price",
-                    "amount",
-                    "subcategory",
-                ],
-            )
-            hubspot_deal_line_items_details.append(detail)
+        hubspot_deal_line_items_details = _fetch_deal_line_item_details(deal_id)
 
         netsuite_sales_rep_id: Optional[str] = None
         hubspot_owner_id = (hubspot_deal.get("properties") or {}).get("hubspot_owner_id")
@@ -432,7 +489,7 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
                 logger.exception("Error resolving sales rep from deal owner")
 
         netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
-        time.sleep(1)
+        _sleep_between_api_calls()
 
         venue_name_prop = (hubspot_deal.get("properties") or {}).get(
             DEAL_VENUE_NAME_PROPERTY, ""
@@ -562,108 +619,24 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
         )
         return True
 
+    except DealInvoiceRejected as exc:
+        logger.warning("Deal invoice mapping rejected for deal %s: %s", deal_id, exc)
+        _set_deal_invoice_status(deal_id, str(exc))
+        return False
+
     except Exception:
         logger.exception("reconcile_deal_invoice failed for deal %s", deal_id)
         raise
 
 
 def process_payment(webhook_data: Dict[str, Any]) -> bool:
-    """Create or update a NetSuite customer payment from a HubSpot payment webhook."""
-    try:
-        payment_id = webhook_data.get("objectId")
-        if not payment_id:
-            logger.error("Payment webhook missing objectId")
-            return False
-
-        hubspot_payment = hubspot.get_payment(payment_id, properties=["hs_initial_amount"])
-        if not hubspot_payment:
-            logger.error("HubSpot payment not found: %s", payment_id)
-            return False
-
-        payment_properties = hubspot_payment.get("properties") or {}
-
-        hs_payment_deal = hubspot.get_payment_deal(payment_id)
-        if not hs_payment_deal or not hs_payment_deal.get("id"):
-            logger.error("No deal associated with payment %s", payment_id)
-            return False
-
-        deal_id = hs_payment_deal.get("id")
-        hubspot_contact = hubspot.get_deal_billing_contact_or_default_contact(deal_id)
-        if not hubspot_contact:
-            logger.error("No contact for deal %s", deal_id)
-            return False
-
-        contact_email = (hubspot_contact.get("properties") or {}).get("email", "")
-        if not contact_email:
-            logger.error("Contact email missing for deal %s", deal_id)
-            return False
-
-        netsuite_customer = get_netsuite_customer_by_email(contact_email)
-        if not netsuite_customer:
-            logger.error("NetSuite customer not found: %s", contact_email)
-            return False
-
-        netsuite_customer_id = netsuite_customer.get("id")
-
-        hubspot_invoice = hubspot.get_payment_invoice(payment_id)
-        if not hubspot_invoice:
-            logger.error("No invoice associated with payment %s", payment_id)
-            return False
-
-        hubspot_deal = hubspot.get_invoice_deal(hubspot_invoice.get("id"))
-        if not hubspot_deal or not hubspot_deal.get("id"):
-            logger.error("No deal associated with invoice")
-            return False
-
-        deal_id = hubspot_deal.get("id")
-        netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
-        if not netsuite_invoice_id:
-            logger.error("NetSuite invoice not found for deal %s", deal_id)
-            return False
-
-        netsuite_payment_id = netsuite.get_payment_by_hubspot_id(payment_id)
-        dprops = hubspot_deal.get("properties") or {}
-        netsuite_venue = netsuite.get_or_create_venue(
-            dprops.get("venue_name", ""),
-            dprops.get("venue_netsuite_id", ""),
-        )
-        netsuite_venue_id = netsuite_venue.get("id")
-
-        netsuite_payment: Dict[str, Any] = {
-            "entity": {"id": netsuite_customer_id},
-            "customer": {"id": netsuite_customer_id},
-            "location": {"id": netsuite_venue_id},
-            "memo": f"Payment for invoice {hubspot_invoice.get('id')}",
-            "payment": float(payment_properties.get("hs_initial_amount") or 0),
-            "tranId": hubspot_deal.get("id"),
-            "externalId": payment_id,
-            "apply": {
-                "items": [{"doc": {"id": netsuite_invoice_id}, "apply": True}],
-            },
-        }
-        if payment_properties.get("hs_payment_date"):
-            netsuite_payment["tranDate"] = payment_properties["hs_payment_date"]
-
-        payment_result = netsuite.create_or_update_payment(netsuite_payment, netsuite_payment_id)
-        if not payment_result.get("success"):
-            # The write itself failed -> transient; let it redrive.
-            raise RuntimeError(
-                f"Payment upsert did not succeed for {payment_id}: {payment_result.get('message')}"
-            )
-
-        # The upsert succeeded; the verification search is eventually consistent, so retry it
-        # a few times. If it still can't be seen, the payment exists anyway — ack with a loud
-        # log instead of looping the message in flight.
-        if not _read_back(lambda: netsuite.get_payment_by_hubspot_id(payment_id)):
-            logger.warning(
-                "[rejected] payment %s upserted but not yet visible via search; acking", payment_id
-            )
-
-        return True
-
-    except Exception:
-        logger.exception("process_payment failed")
-        raise
+    """Payment sync is disabled. Preserved implementation is commented at end of this file."""
+    logger.info(
+        "[payment] - sync disabled; skipping objectId=%s subscriptionType=%s",
+        webhook_data.get("objectId"),
+        webhook_data.get("subscriptionType"),
+    )
+    return True
 
 
 def process_venue(webhook_data: Dict[str, Any]) -> bool:
@@ -789,28 +762,11 @@ def process_line_item(webhook_data: Dict[str, Any]) -> bool:
             return False
         _sleep_between_api_calls()
 
-        hubspot_line_item = hubspot.get_line_item_by_id(
-            line_item_id,
-            properties=[
-                "name",
-                "description",
-                "quantity",
-                "hs_sku",
-                "price",
-                "amount",
-                "subcategory",
-            ],
-        )
-        if not hubspot_line_item:
-            logger.error("Line item not found: %s", line_item_id)
-            return False
-
-        hubspot_deal = hubspot.get_line_item_deal(line_item_id)
-        if not hubspot_deal or not hubspot_deal.get("id"):
+        deal_id = hubspot.get_line_item_deal_id(line_item_id)
+        if not deal_id:
             logger.error("No deal for line item %s", line_item_id)
             return False
 
-        deal_id = hubspot_deal.get("id")
         netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
         if not netsuite_invoice_id:
             logger.info(
@@ -820,25 +776,7 @@ def process_line_item(webhook_data: Dict[str, Any]) -> bool:
             )
             return True
 
-        hubspot_deal_line_items = hubspot.get_deal_line_items(deal_id)
-        hubspot_line_items: List[Dict[str, Any]] = []
-        for line_item in hubspot_deal_line_items:
-            _sleep_between_api_calls()
-            hubspot_line_items.append(
-                hubspot.get_line_item_detail(
-                    line_item.get("id"),
-                    properties=[
-                        "name",
-                        "description",
-                        "quantity",
-                        "hs_sku",
-                        "price",
-                        "amount",
-                        "subcategory",
-                    ],
-                )
-            )
-
+        hubspot_line_items = _fetch_deal_line_item_details(deal_id)
         final_line_items = process_deal_lineitems_change(hubspot_line_items)
         if final_line_items is False:
             return False
@@ -860,8 +798,8 @@ def _resolve_lock_key(webhook_data: Dict[str, Any]) -> Optional[str]:
     """Resolve the serialization key for an event: the parent deal id, or a venue key.
 
     Every event that touches the same NetSuite invoice must share a key so they never run
-    concurrently. Line-item and payment events resolve to their parent deal; venue events
-    use a ``venue:<id>`` key (locations are shared in NetSuite, not per-deal).
+    concurrently. Line-item events resolve to their parent deal; venue events use a
+    ``venue:<id>`` key (locations are shared in NetSuite, not per-deal).
     """
     subscription_type = webhook_data.get("subscriptionType", "")
     object_id = str(webhook_data.get("objectId", "")).strip()
@@ -884,7 +822,9 @@ def _resolve_lock_key(webhook_data: Dict[str, Any]) -> Optional[str]:
     if subscription_type in ("object.creation", "object.propertyChange"):
         object_type = webhook_data.get("objectTypeId")
         if object_type == HUBSPOT_OBJECT_TYPE_PAYMENT:
-            return hubspot.get_payment_deal_id(object_id)
+            return None
+        if object_type == HUBSPOT_OBJECT_TYPE_VENUE:
+            return f"venue:{object_id}"
         if object_type in HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS:
             return hubspot.get_line_item_deal_id(object_id)
 
@@ -894,12 +834,14 @@ def _resolve_lock_key(webhook_data: Dict[str, Any]) -> Optional[str]:
 def process_webhook_message(webhook_data: Dict[str, Any]) -> bool:
     """Serialize per parent deal, then route the event to the right handler.
 
-    The per-deal lock guarantees concurrent deal / line-item / payment events for the same
+    The per-deal lock guarantees concurrent deal / line-item events for the same
     invoice run one at a time which, together with the reconcile-from-state handlers,
     prevents duplicate invoices and NetSuite "Record has been changed" errors. If the lock
     is held by another worker, ``deal_lock`` raises and the SQS message is retried later.
     """
     is_venue_event = _is_venue_event(webhook_data)
+    if _is_payment_webhook(webhook_data):
+        return process_payment(webhook_data)
     if not is_venue_event and not _should_process_object_id(webhook_data):
         return True
 

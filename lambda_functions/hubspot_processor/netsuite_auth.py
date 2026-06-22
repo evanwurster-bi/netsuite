@@ -1,15 +1,14 @@
-import base64
 import logging
 import os
 import time
 import jwt
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from dotenv import load_dotenv
 
-load_dotenv()
+from config import resolve_netsuite_oauth_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -52,25 +51,29 @@ def _id_from_location(response: Optional[requests.Response]) -> Optional[str]:
     return candidate or None
 
 
-def _unescape_pem_line_breaks(s: str) -> str:
-    """Turn literal ``\\n`` / ``\\r`` (as stored in env or YAML) into real newlines; repeat for double-escaped values."""
+def _unescape_pem_text(raw: str) -> str:
+    text = raw
     for _ in range(8):
-        t = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
-        if t == s:
+        updated = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+        if updated == text:
             break
-        s = t
-    return s.replace("\r\n", "\n").replace("\r", "\n")
+        text = updated
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _pem_private_key_bytes_from_cert_string(raw: str) -> bytes:
-    """Normalize ``NETSUITE_CERT_STRING`` into PEM bytes for ``load_pem_private_key``.
+def pem_file_to_cert_string(pem_path: Path) -> str:
+    """Serialize a ``.pem`` file to the one-line ``\\n``-escaped form used in env / secrets."""
+    raw = pem_path.read_text(encoding="utf-8-sig")
+    text = _unescape_pem_text(raw)
+    begin = text.find("-----BEGIN")
+    if begin < 0:
+        raise ValueError(f"{pem_path} is not a valid PEM private key.")
+    lines = [line.strip() for line in text[begin:].splitlines() if line.strip()]
+    return "\n".join(lines).replace("\n", "\\n")
 
-    Accepts:
 
-    * Multiline PEM (real newlines, as in a ``.pem`` file).
-    * One-line PEM with literal ``\\n`` / ``\\r`` between lines (common in env / SAM).
-    * Base64-encoded PEM (single line, no ``-----BEGIN`` until decoded).
-    """
+def _cert_string_to_pem_bytes(raw: str) -> bytes:
+    """Parse ``NETSUITE_CERT_STRING`` / ``netsuite_cert_string`` (inverse of ``pem_file_to_cert_string``)."""
     s = (raw or "").strip()
     if not s:
         raise ValueError("NETSUITE_CERT_STRING is empty")
@@ -78,34 +81,40 @@ def _pem_private_key_bytes_from_cert_string(raw: str) -> bytes:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
         s = s[1:-1].strip()
 
-    s = _unescape_pem_line_breaks(s)
-
-    begin = s.find("-----BEGIN")
-    if begin >= 0:
-        pem_text = s[begin:].rstrip()
-        # Body lines may still carry literal backslash-n if escaping was layered.
-        pem_text = _unescape_pem_line_breaks(pem_text)
-        pem_bytes = pem_text.encode("utf-8")
-        if pem_bytes[:1] != b"-":
-            raise ValueError("PEM text did not start with '-' after normalization.")
-        return pem_bytes
-
-    cleaned = "".join(s.split())
-    decoded = base64.b64decode(cleaned, validate=False)
-    if b"-----BEGIN" not in decoded:
+    text = _unescape_pem_text(s)
+    begin = text.find("-----BEGIN")
+    if begin < 0:
         raise ValueError(
-            "NETSUITE_CERT_STRING must be PEM (multiline, one line with \\n, or base64 PEM); use certificates/private.pem (P-256)."
+            "NETSUITE_CERT_STRING must contain -----BEGIN; "
+            "use \\n between lines (same format as generate_token.py / certificates/private.pem)."
         )
-    return decoded
+
+    block = text[begin:]
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if len(lines) < 2 and "\\n" in block:
+        lines = [part.strip() for part in block.split("\\n") if part.strip()]
+
+    return "\n".join(lines).encode("utf-8")
+
+
+def _load_ec_private_key_from_cert_string(raw: str) -> ec.EllipticCurvePrivateKey:
+    pem_bytes = _cert_string_to_pem_bytes(raw)
+    private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise ValueError("Private key must be an EC key (Elliptic Curve)")
+    return private_key
 
 
 class NetSuiteAuth:
-    """NetSuite REST OAuth (client credentials + JWT). Same env contract as ``generate_token.py``."""
+    """NetSuite REST OAuth (client credentials + JWT).
+
+    Deployed Lambdas read OAuth credentials from Secrets Manager via
+    ``ACCOUNT_SECRET_NAME``. Local tooling uses env vars instead.
+    """
 
     def __init__(self) -> None:
         self.account_id = os.environ["NETSUITE_ACCOUNT_ID"]
-        self.client_id = os.environ["NETSUITE_CLIENT_ID"]
-        self.cert_id = os.environ["NETSUITE_CERT_ID"]
+        self.client_id, self.cert_id, raw_cert = resolve_netsuite_oauth_credentials()
         self.subsidiary_id = os.environ["NETSUITE_SUBSIDIARY_ID"]
         self.token_url = (
             f"https://{self.account_id}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token"
@@ -118,18 +127,12 @@ class NetSuiteAuth:
         self._access_token: Optional[str] = None
         self._access_token_expiry: float = 0.0
 
-        raw_cert = os.environ.get("NETSUITE_CERT_STRING", "").strip()
-        pem_bytes = _pem_private_key_bytes_from_cert_string(raw_cert)
-
         try:
-            self.private_key = serialization.load_pem_private_key(
-                pem_bytes,
-                password=None,
-            )
-            if not isinstance(self.private_key, ec.EllipticCurvePrivateKey):
-                raise ValueError("Private key must be an EC key (Elliptic Curve)")
+            self.private_key = _load_ec_private_key_from_cert_string(raw_cert)
         except Exception as e:
-            raise Exception(f"Error loading private key from environment: {str(e)}") from e
+            raise Exception(
+                f"Error loading NetSuite private key (check netsuite_cert_string in Secrets Manager): {e}"
+            ) from e
 
     def _generate_jwt(self) -> str:
         """Client-assertion JWT (same claims as ``generate_token`` / NetSuite certificate mapping)."""
@@ -346,91 +349,8 @@ class NetSuiteAuth:
         """Get the NetSuite invoice document number (tranId) for an internal invoice id."""
         response = self.make_request('GET', f'record/v1/invoice/{invoice_id}')
         return response.json()['tranId']
-    
-    def get_payment_by_hubspot_id(self, hubspot_payment_id: str) -> str:
-        """Get payment by HubSpot payment ID."""
-        response = self.make_request('GET', 'record/v1/customerpayment', {'q': f'externalId IS "{hubspot_payment_id}"'})
-        items = response.json().get('items', [])
-        if items:
-            return items[0]['id']
-        return None
-    
-    def create_or_update_payment(self, netsuite_payment: Dict[str, Any], payment_id: str = None) -> Dict[str, Any]:
-        """Create or update payment in NetSuite."""
-        if payment_id:
-            # Update existing payment
-            response = self.make_request('PATCH', f'record/v1/customerpayment/{payment_id}', netsuite_payment)
-        else:
-            # Create new payment
-            response = self.make_request('POST', 'record/v1/customerpayment', netsuite_payment)
-        if response.status_code == 204:
-            return {'success': True, 'message': 'Payment updated successfully'}
-        elif response.status_code == 201:
-            return {'success': True, 'message': 'Payment created successfully'}
-        else:
-            return {'success': False, 'message': f'Payment operation failed with status {response.status_code}'}
 
-    # NOTE: Customer deposit / payment-application helpers are kept (commented) for a
-    # future requirement. They are not wired into any handler yet.
-    # def get_customer_deposit_by_hubspot_id(self, hubspot_deal_id: str) -> str:
-    #     """Get customer deposit by HubSpot deal ID."""
-    #     response = self.make_request('GET', 'record/v1/customerdeposit', {'q': f'externalId IS "{hubspot_deal_id}"'})
-    #     items = response.json().get('items', [])
-    #     if items:
-    #         return items[0]['id']
-    #     return None
-    #
-    # def create_or_update_customer_deposit(self, netsuite_customer_deposit: Dict[str, Any], customer_deposit_id: str = None) -> Dict[str, Any]:
-    #     """Create or update customer deposit in NetSuite."""
-    #     if customer_deposit_id:
-    #         # Update existing customer deposit
-    #         response = self.make_request('PATCH', f'record/v1/customerdeposit/{customer_deposit_id}', netsuite_customer_deposit)
-    #     else:
-    #         # Create new customer deposit
-    #         response = self.make_request('POST', 'record/v1/customerdeposit', netsuite_customer_deposit)
-    #
-    #     if response.status_code == 204:
-    #         return {'success': True, 'message': 'Customer deposit updated successfully'}
-    #     elif response.status_code == 201:
-    #         return {'success': True, 'message': 'Customer deposit created successfully'}
-    #     else:
-    #         return {'success': False, 'message': f'Customer deposit operation failed with status {response.status_code}'}
-    #
-    # def deposit_application_to_invoice(self, netsuite_deposit_id: str, netsuite_invoice_id: str) -> Dict[str, Any]:
-    #     """Apply deposit to invoice in NetSuite."""
-    #     response = self.make_request('POST', f'record/v1/customerDeposit/{netsuite_deposit_id}/!transform/depositApplication',
-    #     {
-    #         "deposit": {"id": netsuite_deposit_id},
-    #         "apply": {
-    #             "items": [
-    #                 {
-    #                     "doc": {
-    #                         "id": netsuite_invoice_id,
-    #                     },
-    #                     "apply": True
-    #                 }
-    #             ]
-    #         }
-    #     })
-    #     return response.json()
-    #
-    # def apply_payment_to_invoice(self, netsuite_payment_id: str, netsuite_invoice_id: str) -> Dict[str, Any]:
-    #     """Apply payment to invoice in NetSuite."""
-    #     response = self.make_request('POST', f'record/v1/customerPayment/{netsuite_payment_id}/!transform/paymentApplication',
-    #     {
-    #         "payment": {"id": netsuite_payment_id},
-    #         "apply": {
-    #             "items": [
-    #                 {
-    #                     "doc": {
-    #                         "id": netsuite_invoice_id,
-    #                     },
-    #                     "apply": True
-    #                 }
-    #             ]
-    #         }
-    #     })
-    #     return response.json()
+    # Payment NetSuite helpers disabled — see commented block at end of file.
 
     def get_venue_by_external_id(self, external_id: str) -> str:
         """Get venue by external ID."""
@@ -508,33 +428,83 @@ class NetSuiteAuth:
         
 
     
+    _SUITEQL_IN_CLAUSE_LIMIT = 1000
+
+    @staticmethod
+    def _escape_suiteql_string_literal(value: str) -> str:
+        return str(value).replace("'", "''")
+
+    def search_items_by_sku_batch(self, skus: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Resolve NetSuite items by SKU (itemid). Returns ``{itemid: row}``."""
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for raw in skus:
+            sku = str(raw or "").strip()
+            if not sku or sku in seen:
+                continue
+            seen.add(sku)
+            normalized.append(sku)
+
+        if not normalized:
+            return {}
+
+        matched: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(normalized), self._SUITEQL_IN_CLAUSE_LIMIT):
+            chunk = normalized[start : start + self._SUITEQL_IN_CLAUSE_LIMIT]
+            literals = ", ".join(
+                f"'{self._escape_suiteql_string_literal(sku)}'" for sku in chunk
+            )
+            payload = {
+                "q": (
+                    "SELECT id, itemid, displayname, upccode FROM item "
+                    f"WHERE itemid IN ({literals})"
+                )
+            }
+            response = self.make_request(
+                "POST",
+                "query/v1/suiteql",
+                payload,
+                additional_headers={"Prefer": "transient"},
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "[NetSuite] Batch item SuiteQL failed status=%s skus=%s",
+                    response.status_code,
+                    chunk,
+                )
+                continue
+
+            for row in response.json().get("items", []):
+                itemid = str(row.get("itemid") or "").strip()
+                if itemid:
+                    matched[itemid] = row
+
+        missing = [sku for sku in normalized if sku not in matched]
+        logger.info(
+            "[NetSuite] Batch item lookup requested=%s matched=%s missing=%s",
+            len(normalized),
+            len(matched),
+            len(missing),
+        )
+        if missing:
+            logger.warning("[NetSuite] Batch item lookup missing skus=%s", missing)
+        return matched
+
     def search_item_by_sku(self, sku: str = "") -> Optional[Dict[str, Any]]:
-        """Resolve NetSuite item by SKU only (itemid)."""
+        """Resolve a single NetSuite item by SKU (itemid)."""
         normalized_sku = str(sku or "").strip()
         if not normalized_sku:
             logger.warning("[NetSuite] Missing SKU for item lookup")
             return None
 
-        safe_sku = normalized_sku.replace("'", "''")
-        payload = {
-            "q": f"SELECT id, itemid, displayname, upccode FROM item WHERE itemid = '{safe_sku}'"
-        }
-        response = self.make_request(
-            'POST',
-            'query/v1/suiteql',
-            payload,
-            additional_headers={'Prefer': 'transient'}
-        )
-        if response.status_code == 200:
-            items = response.json().get('items', [])
-            if items:
-                row = items[0]
-                logger.info(
-                    "[NetSuite] Item match by sku=%s netsuite_id=%s",
-                    normalized_sku,
-                    row.get("id"),
-                )
-                return row
+        row = self.search_items_by_sku_batch([normalized_sku]).get(normalized_sku)
+        if row:
+            logger.info(
+                "[NetSuite] Item match by sku=%s netsuite_id=%s",
+                normalized_sku,
+                row.get("id"),
+            )
+            return row
 
         logger.warning(
             "[NetSuite] No item match for sku=%s",

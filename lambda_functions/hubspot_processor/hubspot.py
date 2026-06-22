@@ -1,25 +1,42 @@
 from datetime import datetime, timezone
 import logging
-import os
 import requests
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+class DealInvoiceRejected(ValueError):
+    """Deal field cannot be mapped to NetSuite; ack webhook without SQS retry."""
+
+
+def _parse_whole_number_field(raw: Any, field_label: str) -> int:
+    text = str(raw).strip()
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        raise DealInvoiceRejected(
+            f"Not synced: {field_label} must be a whole number (got {raw!r})"
+        )
+    if number != int(number):
+        raise DealInvoiceRejected(
+            f"Not synced: {field_label} must be a whole number (got {text!r})"
+        )
+    return int(number)
 
 from config import (
     HUBSPOT_DEAL_BILLING_ASSOCIATION_LABEL,
     HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS,
-    HUBSPOT_OBJECT_TYPE_PAYMENT,
     HUBSPOT_OBJECT_TYPE_VENUE,
+    resolve_hubspot_api_key,
 )
 
 
 class HubSpotClient:
-    """Client for interacting with HubSpot API."""
+    """HubSpot CRM client. API key from Secrets Manager (Lambda) or env (local)."""
     
     def __init__(self, api_key: str = None, default_api_version: str = "v3"):
-        """Initialize HubSpot client with API key and default version."""
-        self.api_key = api_key or os.environ['HUBSPOT_API_KEY']
+        self.api_key = api_key or resolve_hubspot_api_key()
         self.default_api_version = default_api_version
         self.headers = {
             'Authorization': f'Bearer {self.api_key}',
@@ -30,105 +47,9 @@ class HubSpotClient:
         """Get base URL for specified API version."""
         version = api_version or self.default_api_version
         return f'https://api.hubapi.com/crm/{version}'
-    
-    def get_invoice(self, invoice_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
-        """Fetch invoice details from HubSpot API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/invoices/{invoice_id}'
-        
-        # Add properties parameter if specified
-        if properties:
-            url += f'?properties={",".join(properties)}'
-        
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        invoice_data = response.json()
-        
-        # Get the invoice line items with another request
-        line_items = self.get_invoice_line_items(invoice_id, api_version)
-        
-        # Add line items to the invoice data
-        if 'properties' not in invoice_data:
-            invoice_data['properties'] = {}
-        invoice_data['properties']['line_items'] = line_items
-        
-        return invoice_data
-    
-    def get_invoice_line_items(self, invoice_id: str, api_version: str = None) -> List[Dict[str, Any]]:
-        """Fetch line items for a specific invoice using associations API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/invoices/{invoice_id}/associations/line_items'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        line_items = response.json().get('results', [])
-        line_items_details = []
-        
-        # Get details for each line item
-        for line_item in line_items:
-            line_item_id = line_item['id']
-            line_item_detail = self.get_line_item_detail(line_item_id, api_version)
-            line_items_details.append(line_item_detail)
-        
-        return line_items_details
-    
-    def get_payment(self, payment_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
-        """Fetch payment details from HubSpot API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/commerce_payments/{payment_id}'
-        
-        # Add properties parameter if specified
-        if properties:
-            url += f'?properties={",".join(properties)}'
-        
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        return response.json()
-    
-    def get_payment_deal(self, payment_id: str, api_version: str = None) -> Dict[str, Any]:
-        """Fetch the deal associated with a payment using associations API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/commerce_payments/{payment_id}/associations/deals'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        deals = response.json().get('results', [])
-        if deals:
-            deal_id = deals[0]['id']
-            return self.get_deal(deal_id, api_version)
-        
-        return None
-    
-    def get_payment_invoice(self, payment_id: str, api_version: str = None) -> Dict[str, Any]:
-        """Fetch the invoice associated with a payment using associations API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/commerce_payments/{payment_id}/associations/invoices'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        invoices = response.json().get('results', [])
-        if invoices:
-            invoice_id = invoices[0]['id']
-            return self.get_invoice(invoice_id, api_version)
-        
-        return None
-    
-    def get_invoice_deal(self, invoice_id: str, api_version: str = None) -> Dict[str, Any]:
-        """Fetch the deal associated with an invoice using associations API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/invoices/{invoice_id}/associations/deals'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        deals = response.json().get('results', [])
-        if deals:
-            deal_id = deals[0]['id']
-            return self.get_deal(deal_id, api_version, properties=['dealname', 'dealstage', 'amount', 'venue', 'venue_netsuite_id', 'venue_name_'])
-        
-        return None
-    
+
+    # Payment / invoice HubSpot helpers are disabled — see commented block at end of file.
+
     def get_contact(self, contact_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
         """Fetch contact details from HubSpot API."""
         base_url = self._get_base_url(api_version)
@@ -260,18 +181,7 @@ class HubSpotClient:
         return response.json()
     
     def get_line_item_by_id(self, line_item_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
-        """Fetch line item details by ID from HubSpot API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/line_items/{line_item_id}'
-        
-        # Add properties parameter if specified
-        if properties:
-            url += f'?properties={",".join(properties)}'
-        
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        return response.json()
+        return self.get_line_item_detail(line_item_id, api_version, properties)
     
     def get_line_item_deal(self, line_item_id: str, api_version: str = None) -> Dict[str, Any]:
         """Fetch the deal associated with a line item using associations API."""
@@ -301,16 +211,6 @@ class HubSpotClient:
         deals = response.json().get('results', [])
         return str(deals[0]['id']) if deals else None
 
-    def get_payment_deal_id(self, payment_id: str, api_version: str = None) -> str | None:
-        """Return only the parent deal id for a payment (no deal fetch). See get_line_item_deal_id."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/commerce_payments/{payment_id}/associations/deals'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-
-        deals = response.json().get('results', [])
-        return str(deals[0]['id']) if deals else None
-    
     def get_deal_contacts(self, deal_id: str, api_version: str = None) -> List[Dict[str, Any]]:
         """Fetch the contacts associated with a deal."""
         base_url = self._get_base_url(api_version)
@@ -351,6 +251,34 @@ class HubSpotClient:
         response.raise_for_status()
         
         return response.json().get('results', [])
+
+    def get_line_item_details_batch(
+        self,
+        line_item_ids: List[str],
+        api_version: str = None,
+        properties: List[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Batch-read line item properties (up to 100 ids per HubSpot request)."""
+        if not line_item_ids:
+            return []
+
+        base_url = self._get_base_url(api_version)
+        url = f'{base_url}/objects/line_items/batch/read'
+        props = list(properties or [])
+        results: List[Dict[str, Any]] = []
+        chunk_size = 100
+
+        for start in range(0, len(line_item_ids), chunk_size):
+            chunk = line_item_ids[start : start + chunk_size]
+            payload = {
+                "properties": props,
+                "inputs": [{"id": line_item_id} for line_item_id in chunk],
+            }
+            response = requests.post(url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            results.extend(response.json().get("results", []))
+
+        return results
     
     def get_line_item_detail(self, line_item_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
         """Fetch details for a specific line item."""
@@ -425,7 +353,10 @@ class HubSpotClient:
             netsuite_invoice['custbody_prod_fee_markup'] = float(production_fee)
         guest_count = properties.get('netsuite_est_guest_count')
         if guest_count is not None and str(guest_count).strip() != '':
-            netsuite_invoice['custbody_guest_count'] = int(guest_count)
+            netsuite_invoice['custbody_guest_count'] = _parse_whole_number_field(
+                guest_count,
+                "netsuite_est_guest_count",
+            )
         for line_item in line_items_data:
             item = {
                 'item': {
@@ -453,7 +384,12 @@ class HubSpotClient:
         subscription_type = payload.get('subscriptionType')
         object_type_id = payload.get('objectTypeId')
 
-        if subscription_type not in ['deal.creation', 'deal.propertyChange', 'payment.creation', 'payment.propertyChange', 'venue.creation', 'venue.propertyChange', 'line_item.creation', 'line_item.propertyChange', 'line_item.deletion', 'object.creation', 'object.propertyChange']:
+        if subscription_type not in [
+            'deal.creation', 'deal.propertyChange',
+            'venue.creation', 'venue.propertyChange',
+            'line_item.creation', 'line_item.propertyChange', 'line_item.deletion',
+            'object.creation', 'object.propertyChange',
+        ]:
             return False, 'Invalid subscription type', None
         
         object_id = payload.get('objectId')
@@ -470,11 +406,9 @@ class HubSpotClient:
             
         elif subscription_type in ['object.creation', 'object.propertyChange']:
             if object_type_id == HUBSPOT_OBJECT_TYPE_VENUE:
-                # Accept any venue property change and let the venue sync logic
-                # fetch the canonical venue object before upserting to NetSuite.
                 return True, '', str(object_id)
-            elif object_type_id == HUBSPOT_OBJECT_TYPE_PAYMENT:
-                return True, '', str(object_id)
+            # elif object_type_id == HUBSPOT_OBJECT_TYPE_PAYMENT:
+            #     return True, '', str(object_id)
             elif object_type_id in HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS:
                 return True, '', str(object_id)
             else:

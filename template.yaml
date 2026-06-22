@@ -14,6 +14,8 @@ Parameters:
     Description: >-
       AWS Secrets Manager secret id (name or ARN) holding the account credentials.
       Expected JSON keys: hubspot_api_key, netsuite_client_id, netsuite_cert_id, netsuite_cert_string.
+      The processor reads HubSpot and NetSuite credentials from this secret at runtime
+      (ACCOUNT_SECRET_NAME).
 
   HubSpotDealStageSyncId:
     Type: String
@@ -93,7 +95,7 @@ Resources:
   HubSpotWebhookQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 960
+      VisibilityTimeout: 250
       ReceiveMessageWaitTimeSeconds: 0
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt HubSpotWebhookDLQ.Arn
@@ -196,13 +198,12 @@ Resources:
       Description: Consumes SQS messages and syncs HubSpot data to NetSuite
       CodeUri: lambda_functions/hubspot_processor/
       Handler: sqs_processor.lambda_handler
-      Timeout: 900
+      Timeout: 200
       MemorySize: 1024
       Layers:
         - !Ref DependenciesLayer
       Environment:
         Variables:
-          HUBSPOT_API_KEY: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:hubspot_api_key}}"
           HUBSPOT_DEAL_STAGE_SYNC_ID: !Ref HubSpotDealStageSyncId
           HUBSPOT_OBJECT_TYPE_VENUE: !Ref HubSpotObjectTypeVenue
           HUBSPOT_OBJECT_TYPE_PAYMENT: !Ref HubSpotObjectTypePayment
@@ -211,21 +212,24 @@ Resources:
           WEBHOOK_OBJECT_ID_FILTER_ENABLED: !Ref WebhookObjectIdFilterEnabled
           WEBHOOK_OBJECT_ID_FILTER_VALUE: !Ref WebhookObjectIdFilterValue
           NETSUITE_ACCOUNT_ID: !Ref NetSuiteAccountId
-          NETSUITE_CLIENT_ID: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_client_id}}"
-          NETSUITE_CERT_ID: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_id}}"
           NETSUITE_SUBSIDIARY_ID: !Ref NetSuiteSubsidiaryId
-          NETSUITE_CERT_STRING: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:netsuite_cert_string}}"
+          ACCOUNT_SECRET_NAME: !Ref SecretName
           SYNC_LOCK_TABLE: !Ref SyncLockTable
           API_CALL_DELAY_SECONDS: !Ref ApiCallDelaySeconds
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncLockTable
+        - Statement:
+            - Sid: ReadAccountSecret
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}*'
       Events:
         Queue:
           Type: SQS
           Properties:
             Queue: !GetAtt HubSpotWebhookQueue.Arn
-            BatchSize: 5
+            BatchSize: 1
             MaximumBatchingWindowInSeconds: 0
             ScalingConfig:
               MaximumConcurrency: !Ref ProcessorMaxConcurrency

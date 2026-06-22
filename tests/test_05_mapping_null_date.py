@@ -28,3 +28,23 @@ def test_valid_event_date_sets_trandate():
         _deal({"event_start_date_and_time": "2025-08-01T12:30:00Z"}), "100", "1", "200", []
     )
     assert inv["tranDate"] == "2025-08-01"
+
+
+def test_whole_number_guest_count_maps():
+    c = hubspot.HubSpotClient()
+    inv = c.map_to_netsuite_format(
+        _deal({"netsuite_est_guest_count": "101"}), "100", "1", "200", []
+    )
+    assert inv["custbody_guest_count"] == 101
+
+
+def test_decimal_guest_count_rejected():
+    c = hubspot.HubSpotClient()
+    try:
+        c.map_to_netsuite_format(
+            _deal({"netsuite_est_guest_count": "101.5"}), "100", "1", "200", []
+        )
+        assert False, "expected DealInvoiceRejected"
+    except hubspot.DealInvoiceRejected as exc:
+        assert "101.5" in str(exc)
+        assert "whole number" in str(exc)

@@ -1,5 +1,5 @@
 # Whitelist-only repo: ignore everything, then un-ignore versioned paths.
-# See README.md.
+# Credentials, certificates, and local env files never enter git.
 
 *
 
@@ -25,7 +25,7 @@
 !samconfig accounts/
 !samconfig accounts/**
 
-# Local-only
+# Local-only (never commit)
 .env
 .env.*
 !.env.example
@@ -33,6 +33,11 @@
 certificates/
 secrets/
 generate_token.py
+push_*_secrets*.py
+push_*_temp.py
+
+*-credentials*.txt
+netsuite-oauth-credentials*.txt
 
 *.pem
 *.key

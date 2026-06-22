@@ -1,10 +1,13 @@
 # Exclude from SAM build artifacts (Lambda deployment packages only).
+# Tests stay in git; they are omitted here so they are not bundled into Lambda.
 
 # Not runtime code
 tests/
 docs/
 samconfig accounts/
 generate_token.py
+push_*_secrets*.py
+push_*_temp.py
 
 # Credentials and local config
 certificates/
@@ -12,10 +15,14 @@ secrets/
 .env
 .env.*
 
+*-credentials*.txt
+netsuite-oauth-credentials*.txt
+
 *.pem
 *.key
 *.pfx
 *.p12
+private_key.pem
 
 # Tooling / VCS / build cache
 .aws-sam/
@@ -27,5 +34,3 @@ __pycache__/
 
 # Docs not required in the bundle
 *.md
-
-push_sa

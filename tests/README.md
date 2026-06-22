@@ -25,9 +25,10 @@ a throwaway EC key so the modules import without real credentials.
 | `test_01_webhook_batch_and_signature.py` | 01, 07 | every batch event enqueued; partial-enqueue → 500; missing queue URL → 500; v3 signature valid/tampered/stale/missing/handler-401 |
 | `test_02_lock_and_lock_key.py` | 03, 04, 08 | lock acquire/release, contention raises, TTL re-acquire, no lock-stealing; line-item/payment/deal resolve to the **same** parent-deal key; venue uses `venue:<id>` |
 | `test_03_processor_retry_semantics.py` | 02 | exception → `batchItemFailures`; `False` → redrive; `True` → ack; only the failing record reported |
-| `test_04_netsuite_auth.py` | 06, 03 | `Retry-After` parsing; token cached + refresh on expiry; duplicate-`externalId` POST recovers via PATCH |
+| `test_04_netsuite_auth.py` | 06, 03 | `Retry-After` parsing; token cached + refresh on expiry; duplicate-`externalId` POST recovers via PATCH; runtime secret resolution |
 | `test_05_mapping_null_date.py` | 09 | missing/malformed `event_start_date_and_time` omits `tranDate` (no crash); valid date set |
 | `test_06_reconcile_partial_failure.py` | 05 | happy path; writeback failure raises (retryable) with invoice already committed; retry does not duplicate; failed upsert never stamps the deal |
+| `test_07_line_item_filter.py` | — | local line-item filters run before NetSuite SKU lookups; skip summary for ineligible SKUs |
 
 ## What these unit tests do *not* cover
 

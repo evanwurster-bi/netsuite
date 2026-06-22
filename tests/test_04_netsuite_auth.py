@@ -3,9 +3,13 @@
 See docs/failure-scenarios/06-netsuite-rate-limit-and-token.md and 03-duplicate-invoice-concurrent-create.md.
 """
 
-import requests
+import os
 
+import config
 import netsuite_auth as na
+import requests
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 # --- Retry-After parsing (scenario 06) -----------------------------------------------------
@@ -142,3 +146,50 @@ def test_id_from_location_parsing():
 
     assert na._id_from_location(Resp()) == "12345"
     assert na._id_from_location(type("R", (), {"headers": {}})()) is None
+
+
+def test_cert_string_round_trip_like_generate_token():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    cert_string = na.pem_file_to_cert_string(root / "certificates" / "private.pem")
+    pem_bytes = na._cert_string_to_pem_bytes(cert_string)
+    key = serialization.load_pem_private_key(pem_bytes, password=None)
+    assert isinstance(key, ec.EllipticCurvePrivateKey)
+    na._load_ec_private_key_from_cert_string(cert_string)
+
+
+def test_resolve_netsuite_oauth_credentials_from_secret(monkeypatch):
+    config._secret_json_cache.clear()
+    monkeypatch.setenv("ACCOUNT_SECRET_NAME", "hs-netsuite/sandbox/test")
+    monkeypatch.delenv("NETSUITE_CLIENT_ID", raising=False)
+
+    class FakeSecretsClient:
+        def get_secret_value(self, SecretId):
+            assert SecretId == "hs-netsuite/sandbox/test"
+            return {
+                "SecretString": (
+                    '{"netsuite_client_id":"cid","netsuite_cert_id":"kid",'
+                    '"netsuite_cert_string":"' + os.environ["NETSUITE_CERT_STRING"].replace("\n", "\\n") + '"}'
+                )
+            }
+
+    monkeypatch.setattr(config.boto3, "client", lambda _name: FakeSecretsClient())
+    client_id, cert_id, cert_string = config.resolve_netsuite_oauth_credentials()
+    assert client_id == "cid"
+    assert cert_id == "kid"
+    assert "BEGIN PRIVATE KEY" in cert_string
+    assert config._secret_json_cache["hs-netsuite/sandbox/test"]["netsuite_client_id"] == "cid"
+
+
+def test_resolve_hubspot_api_key_from_secret(monkeypatch):
+    config._secret_json_cache.clear()
+    monkeypatch.setenv("ACCOUNT_SECRET_NAME", "hs-netsuite/sandbox/test")
+    monkeypatch.delenv("HUBSPOT_API_KEY", raising=False)
+
+    class FakeSecretsClient:
+        def get_secret_value(self, SecretId):
+            return {"SecretString": '{"hubspot_api_key":"pat-test"}'}
+
+    monkeypatch.setattr(config.boto3, "client", lambda _name: FakeSecretsClient())
+    assert config.resolve_hubspot_api_key() == "pat-test"

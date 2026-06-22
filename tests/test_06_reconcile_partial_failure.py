@@ -9,6 +9,7 @@ we can drive it to the final HubSpot writeback and assert what happens when step
 import pytest
 
 import sqs_processor as sp
+from hubspot import DealInvoiceRejected
 
 
 class FakeHubSpot:
@@ -45,6 +46,9 @@ class FakeHubSpot:
             },
         }
 
+    def get_line_item_details_batch(self, line_item_ids, properties=None):
+        return [self.get_line_item_detail(line_item_id, properties) for line_item_id in line_item_ids]
+
     def get_venue_by_name(self, venue_name, properties=None):
         return {"id": "hs-venue-1", "properties": {"name": venue_name}}
 
@@ -75,6 +79,9 @@ class FakeNetSuite:
 
     def get_or_create_venue(self, name, external_id):
         return {"id": "loc-1"}
+
+    def search_items_by_sku_batch(self, skus):
+        return {sku: {"id": "item-1"} for sku in skus}
 
     def search_item_by_sku(self, sku):
         return {"id": "item-1"}
@@ -133,6 +140,30 @@ def test_failed_upsert_raises_before_stamping(wired):
     with pytest.raises(RuntimeError):
         sp.reconcile_deal_invoice("123")
     assert fake_hs.writeback_calls == 0  # never stamped "Invoice created" on a failed upsert
+
+
+def test_mapping_rejection_returns_false_and_sets_status(wired, monkeypatch):
+    fake_hs, fake_ns = wired
+    statuses: list[str] = []
+    monkeypatch.setattr(
+        sp,
+        "_set_deal_invoice_status",
+        lambda deal_id, status: statuses.append(status),
+    )
+
+    def reject_mapping(*_args, **_kwargs):
+        raise DealInvoiceRejected(
+            "Not synced: netsuite_est_guest_count must be a whole number (got '101.5')"
+        )
+
+    fake_hs.map_to_netsuite_format = reject_mapping
+
+    assert sp.reconcile_deal_invoice("123") is False
+    assert fake_ns.create_calls == 0
+    assert fake_hs.writeback_calls == 0
+    assert statuses == [
+        "Not synced: netsuite_est_guest_count must be a whole number (got '101.5')"
+    ]
 
 
 def test_search_index_lag_does_not_stick_the_message(wired, monkeypatch):
