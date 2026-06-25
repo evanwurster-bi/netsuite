@@ -74,19 +74,5 @@ def test_line_item_and_deal_resolve_to_same_key(monkeypatch):
     assert deal_key == line_key == "123"  # => mutually exclusive, no concurrent invoice write
 
 
-import pytest
-
-import sqs_processor as sp
-
-
-@pytest.mark.skip(reason="Payment sync disabled")
-def test_payment_event_resolves_to_parent_deal(monkeypatch):
-    monkeypatch.setattr(sp.hubspot, "get_payment_deal_id", lambda _id: "123")
-    key = sp._resolve_lock_key(
-        {"objectId": "55", "subscriptionType": "object.creation", "objectTypeId": sp.HUBSPOT_OBJECT_TYPE_PAYMENT}
-    )
-    assert key == "123"
-
-
 def test_venue_event_uses_venue_scoped_key():
     assert sp._resolve_lock_key({"objectId": "77", "subscriptionType": "venue.creation"}) == "venue:77"

@@ -17,5 +17,5 @@ profile = "dev-cetdigit"
 disable_rollback = true
 # Secrets (HubSpot token + NetSuite client id / cert id / private key) live in AWS Secrets Manager.
 # Only the secret name and non-sensitive config are stored here.
-parameter_overrides = "SecretName=\"hs-netsuite/sandbox/bestimpressions\" HubSpotDealStageSyncId=\"1059843170\" HubSpotObjectTypeVenue=\"2-47363405\" HubSpotObjectTypePayment=\"0-101\" HubSpotObjectTypeLineItem=\"0-8\" DealVenueNameProperty=\"venu_name_sync\" WebhookObjectIdFilterEnabled=\"false\" WebhookObjectIdFilterValue=\"60177497455\" NetSuiteAccountId=\"3763009-sb1\" NetSuiteSubsidiaryId=\"2\""
+parameter_overrides = "SecretName=\"hs-netsuite/sandbox/bestimpressions\" HubSpotDealStageCreateId=\"1059843169\" HubSpotDealStageUpdateId=\"1059843170,1354090846,1059843158,1083991396,1083978271,1083978272,1316012841\" HubSpotObjectTypeVenue=\"2-47363405\" HubSpotObjectTypePayment=\"0-101\" HubSpotObjectTypeLineItem=\"0-8\" DealVenueNameProperty=\"venu_name_sync\" WebhookObjectIdFilterEnabled=\"false\" WebhookObjectIdFilterValue=\"60177497455\" NetSuiteAccountId=\"3763009-sb1\" NetSuiteSubsidiaryId=\"2\""
 image_repositories = []

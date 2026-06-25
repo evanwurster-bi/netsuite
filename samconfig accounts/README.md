@@ -26,3 +26,14 @@ sam deploy --config-file "samconfig accounts/reliability/duvall.toml"
 ```
 
 Replace `duvall` with `bestimpressions` or `rockytop` for the other accounts.
+
+## Deal stage parameters
+
+Each account's `parameter_overrides` includes two stage lists (comma-separated HubSpot internal IDs):
+
+| SAM parameter | Lambda env var | Purpose |
+|---------------|----------------|---------|
+| `HubSpotDealStageCreateId` | `HUBSPOT_DEAL_STAGE_CREATE_ID` | Stage(s) that may **create** a NetSuite invoice |
+| `HubSpotDealStageUpdateId` | `HUBSPOT_DEAL_STAGE_UPDATE_ID` | Stage(s) that may **update** an existing invoice only |
+
+Both require `prior_netsuite_invoice = no` on the deal. See the main [README](../README.md#deal--invoice) for per-account stage IDs.

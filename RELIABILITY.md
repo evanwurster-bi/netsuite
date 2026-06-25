@@ -110,10 +110,9 @@ New module [`lambda_functions/hubspot_processor/locks.py`](lambda_functions/hubs
 In [`sqs_processor.py`](lambda_functions/hubspot_processor/sqs_processor.py):
 
 - `_resolve_lock_key()` maps every event to its **parent deal id** — deal events use their
-  own id; line-item and payment events resolve the parent via cheap association-only lookups
-  (`get_line_item_deal_id` / `get_payment_deal_id` added to
-  [`hubspot.py`](lambda_functions/hubspot_processor/hubspot.py)); venue events use a
-  `venue:<id>` key (locations are shared, not per-deal).
+  own id; line-item events resolve the parent via `get_line_item_deal_id` in
+  [`hubspot.py`](lambda_functions/hubspot_processor/hubspot.py); venue events use a
+  `venue:<id>` key (locations are shared, not per-deal). Payment events skip locking.
 - `process_webhook_message()` acquires `deal_lock(key)` and then dispatches via
   `_dispatch_webhook_message()`. Concurrent deal + line-item events for the same invoice now
   process one at a time → no duplicate invoices, no NetSuite "Record has been changed".

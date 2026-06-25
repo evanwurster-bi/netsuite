@@ -48,8 +48,6 @@ class HubSpotClient:
         version = api_version or self.default_api_version
         return f'https://api.hubapi.com/crm/{version}'
 
-    # Payment / invoice HubSpot helpers are disabled — see commented block at end of file.
-
     def get_contact(self, contact_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
         """Fetch contact details from HubSpot API."""
         base_url = self._get_base_url(api_version)
@@ -180,29 +178,8 @@ class HubSpotClient:
         
         return response.json()
     
-    def get_line_item_by_id(self, line_item_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
-        return self.get_line_item_detail(line_item_id, api_version, properties)
-    
-    def get_line_item_deal(self, line_item_id: str, api_version: str = None) -> Dict[str, Any]:
-        """Fetch the deal associated with a line item using associations API."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/line_items/{line_item_id}/associations/deals'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-
-        deals = response.json().get('results', [])
-        if deals:
-            deal_id = deals[0]['id']
-            return self.get_deal(deal_id, api_version)
-
-        return None
-
     def get_line_item_deal_id(self, line_item_id: str, api_version: str = None) -> str | None:
-        """Return only the parent deal id for a line item (no deal fetch).
-
-        Used to resolve the per-deal lock key cheaply; ``get_line_item_deal`` fetches the
-        full deal and is used by the handlers that need its properties.
-        """
+        """Return only the parent deal id for a line item (no deal fetch)."""
         base_url = self._get_base_url(api_version)
         url = f'{base_url}/objects/line_items/{line_item_id}/associations/deals'
         response = requests.get(url, headers=self.headers)
@@ -279,17 +256,6 @@ class HubSpotClient:
             results.extend(response.json().get("results", []))
 
         return results
-    
-    def get_line_item_detail(self, line_item_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
-        """Fetch details for a specific line item."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/line_items/{line_item_id}'
-        if properties:
-            url += f'?properties={",".join(properties)}'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        return response.json()
     
     def map_to_netsuite_format(self, hubspot_deal: Dict[str, Any], netsuite_customer_id: str, netsuite_customer_subsidiary_id: str, venue_netsuite_id: str, line_items_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Map HubSpot deal data to NetSuite invoice format."""
@@ -407,8 +373,6 @@ class HubSpotClient:
         elif subscription_type in ['object.creation', 'object.propertyChange']:
             if object_type_id == HUBSPOT_OBJECT_TYPE_VENUE:
                 return True, '', str(object_id)
-            # elif object_type_id == HUBSPOT_OBJECT_TYPE_PAYMENT:
-            #     return True, '', str(object_id)
             elif object_type_id in HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS:
                 return True, '', str(object_id)
             else:

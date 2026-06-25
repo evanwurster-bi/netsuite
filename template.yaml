@@ -17,10 +17,15 @@ Parameters:
       The processor reads HubSpot and NetSuite credentials from this secret at runtime
       (ACCOUNT_SECRET_NAME).
 
-  HubSpotDealStageSyncId:
+  HubSpotDealStageCreateId:
     Type: String
-    Default: "1233582150"
-    Description: HubSpot deal stage internal ID(s) that trigger NetSuite invoice sync for dealstage webhooks. Comma-separated list allowed.
+    Default: "1233582149"
+    Description: HubSpot deal stage internal ID(s) that may CREATE a NetSuite invoice. Comma-separated list allowed.
+
+  HubSpotDealStageUpdateId:
+    Type: String
+    Default: ""
+    Description: HubSpot deal stage internal ID(s) that may UPDATE an existing NetSuite invoice only (no create). Comma-separated list allowed.
 
   HubSpotObjectTypeVenue:
     Type: String
@@ -204,7 +209,8 @@ Resources:
         - !Ref DependenciesLayer
       Environment:
         Variables:
-          HUBSPOT_DEAL_STAGE_SYNC_ID: !Ref HubSpotDealStageSyncId
+          HUBSPOT_DEAL_STAGE_CREATE_ID: !Ref HubSpotDealStageCreateId
+          HUBSPOT_DEAL_STAGE_UPDATE_ID: !Ref HubSpotDealStageUpdateId
           HUBSPOT_OBJECT_TYPE_VENUE: !Ref HubSpotObjectTypeVenue
           HUBSPOT_OBJECT_TYPE_PAYMENT: !Ref HubSpotObjectTypePayment
           HUBSPOT_OBJECT_TYPE_LINE_ITEM: !Ref HubSpotObjectTypeLineItem

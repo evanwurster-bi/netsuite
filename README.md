@@ -46,7 +46,14 @@ Each account stores credentials in **AWS Secrets Manager**. The processor receiv
 | `netsuite_cert_id` | `NetSuiteAuth` (OAuth JWT `kid`) |
 | `netsuite_cert_string` | `NetSuiteAuth` (EC P-256 private key PEM) |
 
-Non-secret deploy parameters (NetSuite account id, subsidiary, HubSpot object type IDs, stage filters) are passed via `samconfig accounts/sandbox/*.toml` → CloudFormation parameters → Lambda env vars.
+Non-secret deploy parameters (NetSuite account id, subsidiary, HubSpot object type IDs, deal stage filters) are passed via `samconfig accounts/sandbox/*.toml` → CloudFormation parameters → Lambda env vars.
+
+| SAM parameter | Lambda env var | Purpose |
+|---------------|----------------|---------|
+| `HubSpotDealStageCreateId` | `HUBSPOT_DEAL_STAGE_CREATE_ID` | Deal stage(s) allowed to **create** a NetSuite invoice |
+| `HubSpotDealStageUpdateId` | `HUBSPOT_DEAL_STAGE_UPDATE_ID` | Deal stage(s) allowed to **update** an existing invoice only |
+
+Both accept comma-separated HubSpot internal stage IDs.
 
 All three sandbox accounts share the same NetSuite OAuth integration; only the HubSpot token differs per secret.
 
@@ -134,27 +141,64 @@ python -m pytest tests/ -q
 
 ### Deal → invoice
 
-- Sync when `prior_netsuite_invoice = no` and deal stage is in `HUBSPOT_DEAL_STAGE_SYNC_ID`.
+Invoice sync is gated by **deal stage** and the HubSpot property `prior_netsuite_invoice`. Both must pass before any NetSuite write runs.
+
+#### Prerequisites (all stages)
+
+Every enabled stage — create and update — requires:
+
+- `prior_netsuite_invoice = no` (if `yes`, blank, or missing, sync is skipped and the reason is written to `netsuite_invoice_status` on the deal)
+
+#### Stage modes
+
+| Mode | Env var | Behaviour |
+|------|---------|-----------|
+| **Create** | `HUBSPOT_DEAL_STAGE_CREATE_ID` | May **create** a new invoice or **re-sync** an existing one for the deal |
+| **Update** | `HUBSPOT_DEAL_STAGE_UPDATE_ID` | May **update** an invoice only when one already exists in NetSuite; never creates |
+
+Evaluation order in the processor:
+
+1. Deal stage is listed in create or update config
+2. `prior_netsuite_invoice = no`
+3. If update stage → NetSuite invoice must already exist for the deal
+4. Remaining business rules (contact, customer, subsidiary, venue, line items)
+
+Stages not listed in either variable are ignored.
+
+#### Per-account stage configuration
+
+Configured in each account's `samconfig accounts/sandbox/<account>.toml` (and mirrored under `reliability/`):
+
+| Account | Create (`HubSpotDealStageCreateId`) | Update (`HubSpotDealStageUpdateId`) |
+|---------|-------------------------------------|-------------------------------------|
+| Best Impressions | `1059843169` | `1059843170`, `1354090846`, `1059843158`, `1083991396`, `1083978271`, `1083978272`, `1316012841` |
+| Duvall | `1233582149` | `1233582150`, `1359365640`, `1233582151`, `1233582152`, `1233582153`, `1233582154`, `1359365641`, `1316739225` |
+| Rocky Top | `1208741442` | `1343333815`, `1208741443`, `1359370264`, `1208741444`, `1208741445`, `1208741446`, `1208741447`, `1346864770` |
+
+To add or change stages, edit the comma-separated values in the account's `parameter_overrides` and redeploy. No code change is required.
+
+#### Additional invoice rules
+
 - Billing contact: HubSpot association label `Billing`, else first associated contact.
 - Customer: NetSuite lookup by contact email; must belong to deploy subsidiary (`NETSUITE_SUBSIDIARY_ID`).
 - Venue: resolved from `DEAL_VENUE_NAME_PROPERTY` → NetSuite `location`.
 
 ### Line items
 
-Deal line items are loaded with **one associations call + one HubSpot batch read** (`get_line_item_details_batch`), then filtered locally before any NetSuite SKU lookup ([`process_deal_lineitems_change`](lambda_functions/hubspot_processor/sqs_processor.py)):
+Deal line items are loaded with **one associations call + one HubSpot batch read** (`get_line_item_details_batch`), **consolidated by SKU** (quantities and amounts summed, rate recalculated), then validated and resolved with **one SuiteQL batch lookup** per deal ([`process_deal_lineitems_change`](lambda_functions/hubspot_processor/sqs_processor.py)):
 
 | Rule | Action |
 |------|--------|
 | `subcategory = Owned Equipment` and `amount <= 0` | Skipped |
 | SKU missing or not starting with `3` | Skipped |
 | SKU passes filters but not found in NetSuite | Logged as error, skipped for invoice |
-| SKU passes filters and found | Mapped to invoice line |
+| SKU passes filters and found | One consolidated invoice line per SKU |
 
-CloudWatch logs include a filter summary (`total`, `eligible`, `skipped`, `by_reason`) and per-line skip reasons under the `[lines]` prefix.
+CloudWatch logs include consolidation stats, a filter summary (`total`, `eligible`, `skipped`, `by_reason`), and per-line skip reasons under the `[lines]` prefix.
 
 ### Payments
 
-Payment sync is **disabled**. Payment webhooks are acked immediately with `[payment] sync disabled`. Preserved reference implementation: [`_payment_sync_disabled.py`](lambda_functions/hubspot_processor/_payment_sync_disabled.py).
+Payment sync is **disabled**. Payment webhooks are acknowledged immediately with `[payment] sync disabled` and are not serialized under a deal lock.
 
 ## Troubleshooting
 
@@ -167,7 +211,7 @@ Payment sync is **disabled**. Payment webhooks are acked immediately with `[paym
 | Messages in DLQ | Persistent failure after 5 receives — inspect message body and processor logs |
 | `Invalid Field Value ... location` | Subsidiary / location mismatch in NetSuite |
 | `Record has been changed` | Concurrent invoice update (lock should prevent this in normal operation) |
-| Invoice sync skipped | Deal stage not in allowlist or `prior_netsuite_invoice != no` |
+| Invoice sync skipped | Deal stage not in create/update config, `prior_netsuite_invoice != no`, or update stage with no existing NetSuite invoice |
 | OAuth fails locally (`secp521r1`) | Private key must be P-256 (`secp256r1`) for ES256 |
 
 ## Security

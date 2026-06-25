@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from config import (
     DEAL_VENUE_NAME_PROPERTY,
-    HUBSPOT_DEAL_STAGE_SYNC_IDS,
+    HUBSPOT_DEAL_STAGE_CREATE_IDS,
+    HUBSPOT_DEAL_STAGE_UPDATE_IDS,
     HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS,
     HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY,
     HUBSPOT_OBJECT_TYPE_PAYMENT,
@@ -142,17 +143,29 @@ def _should_process_object_id(webhook_data: Dict[str, Any]) -> bool:
     return True
 
 
+def _deal_stage_invoice_mode(stage: str) -> Optional[str]:
+    """Return ``create``, ``update``, or ``None`` when the stage is not enabled."""
+    normalized = stage.strip()
+    if normalized in HUBSPOT_DEAL_STAGE_CREATE_IDS:
+        return "create"
+    if normalized in HUBSPOT_DEAL_STAGE_UPDATE_IDS:
+        return "update"
+    return None
+
+
 def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
     """
-    Process deal-to-invoice only when HubSpot property prior_netsuite_invoice is No.
-    If it is Yes, blank, or missing, the invoice is not created.
-    This is the first gate for deal invoice processing.
-    This guard runs independently from WEBHOOK_OBJECT_ID_FILTER_ENABLED.
+    Gate deal-to-invoice processing by deal stage:
+
+    - All enabled stages require ``prior_netsuite_invoice = No``.
+    - Create stages (``HUBSPOT_DEAL_STAGE_CREATE_ID``): may create or re-sync an invoice.
+    - Update stages (``HUBSPOT_DEAL_STAGE_UPDATE_ID``): may update only when a NetSuite
+      invoice already exists for the deal.
     """
     deal_id = str(webhook_data.get("objectId", "")).strip()
     if not deal_id:
         logger.warning(
-            "[deal] - Missing objectId while evaluating prior_netsuite_invoice; skipping invoice sync"
+            "[deal] - Missing objectId while evaluating deal stage; skipping invoice sync"
         )
         return False
 
@@ -163,26 +176,28 @@ def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
     _sleep_between_api_calls()
     if not hubspot_deal:
         logger.warning(
-            "[deal] - Could not load deal %s to evaluate prior_netsuite_invoice; skipping invoice sync",
+            "[deal] - Could not load deal %s to evaluate deal stage; skipping invoice sync",
             deal_id,
         )
         return False
 
     current_deal_stage = str((hubspot_deal.get("properties") or {}).get("dealstage", "")).strip()
-    allowed_deal_stages = tuple(str(stage).strip() for stage in HUBSPOT_DEAL_STAGE_SYNC_IDS if str(stage).strip())
-    if not allowed_deal_stages:
-        logger.warning(
-            "[deal] - HUBSPOT_DEAL_STAGE_SYNC_ID is empty; skipping invoice sync for deal %s",
-            deal_id,
-        )
-        return False
-    if current_deal_stage not in allowed_deal_stages:
-        logger.info(
-            "[deal] - Skipping invoice sync for deal %s because dealstage=%s allowed=%s",
-            deal_id,
-            current_deal_stage or "missing",
-            ",".join(allowed_deal_stages),
-        )
+    stage_mode = _deal_stage_invoice_mode(current_deal_stage)
+    if stage_mode is None:
+        if not HUBSPOT_DEAL_STAGE_CREATE_IDS and not HUBSPOT_DEAL_STAGE_UPDATE_IDS:
+            logger.warning(
+                "[deal] - HUBSPOT_DEAL_STAGE_CREATE_ID and HUBSPOT_DEAL_STAGE_UPDATE_ID are empty; "
+                "skipping invoice sync for deal %s",
+                deal_id,
+            )
+        else:
+            logger.info(
+                "[deal] - Skipping invoice sync for deal %s because dealstage=%s create=%s update=%s",
+                deal_id,
+                current_deal_stage or "missing",
+                ",".join(HUBSPOT_DEAL_STAGE_CREATE_IDS),
+                ",".join(HUBSPOT_DEAL_STAGE_UPDATE_IDS),
+            )
         _set_deal_invoice_status(
             deal_id,
             f"Not created: deal stage {current_deal_stage or 'missing'} is not enabled for invoice sync",
@@ -206,6 +221,28 @@ def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
 
     netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
     _sleep_between_api_calls()
+
+    if stage_mode == "update":
+        if not netsuite_invoice_id:
+            logger.info(
+                "[deal] - Skipping invoice sync for deal %s because dealstage=%s is update-only "
+                "and no NetSuite invoice exists yet",
+                deal_id,
+                current_deal_stage,
+            )
+            _set_deal_invoice_status(
+                deal_id,
+                f"Not created: deal stage {current_deal_stage} is update-only and no NetSuite invoice exists yet",
+            )
+            return False
+        logger.info(
+            "[deal] - Update-only stage %s; processing invoice %s for deal %s",
+            current_deal_stage,
+            netsuite_invoice_id,
+            deal_id,
+        )
+        return True
+
     if netsuite_invoice_id:
         logger.info(
             "[deal] - prior_netsuite_invoice=No and invoice %s exists for deal %s; processing re-sync",
@@ -239,6 +276,77 @@ def _is_payment_webhook(webhook_data: Dict[str, Any]) -> bool:
     )
 
 
+def _parse_line_amount(raw: Any) -> float:
+    try:
+        return float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_line_quantity(raw: Any) -> float:
+    try:
+        return float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _consolidate_line_items_by_sku(
+    hubspot_line_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Group HubSpot lines by ``hs_sku`` and build one synthetic row per SKU."""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    group_order: List[str] = []
+
+    for hubspot_line_item in hubspot_line_items:
+        props = hubspot_line_item.get("properties") or {}
+        sku = str(props.get("hs_sku") or "").strip()
+        if sku not in groups:
+            groups[sku] = []
+            group_order.append(sku)
+        groups[sku].append(hubspot_line_item)
+
+    consolidated: List[Dict[str, Any]] = []
+    for sku in group_order:
+        items = groups[sku]
+        total_quantity = 0.0
+        total_amount = 0.0
+        name = ""
+        subcategory = ""
+
+        for hubspot_line_item in items:
+            props = hubspot_line_item.get("properties") or {}
+            if not name:
+                name = str(props.get("name") or "").strip()
+            if not subcategory:
+                subcategory = str(props.get("subcategory") or "").strip()
+            total_quantity += _parse_line_quantity(props.get("quantity"))
+            total_amount += _parse_line_amount(props.get("amount"))
+
+        rate = total_amount / total_quantity if total_quantity else 0.0
+        logger.info(
+            "[lines] - Consolidated sku=%s from %s HubSpot line(s) qty=%s amount=%s rate=%s",
+            sku or "missing",
+            len(items),
+            total_quantity,
+            total_amount,
+            rate,
+        )
+        consolidated.append(
+            {
+                "properties": {
+                    "hs_sku": sku,
+                    "name": name,
+                    "quantity": total_quantity,
+                    "amount": total_amount,
+                    "price": rate,
+                    "subcategory": subcategory,
+                }
+            }
+        )
+
+    return consolidated
+
+
 def _parse_hubspot_line_item(
     hubspot_line_item: Dict[str, Any],
     skip_sub_category: str,
@@ -248,11 +356,7 @@ def _parse_hubspot_line_item(
     current_sub_category = str(props.get("subcategory") or "").strip().lower()
     hubspot_item_sku = str(props.get("hs_sku") or "").strip()
     hubspot_item_name = str(props.get("name") or "").strip()
-    line_amount_raw = props.get("amount")
-    try:
-        line_amount = float(line_amount_raw or 0)
-    except (TypeError, ValueError):
-        line_amount = 0.0
+    line_amount = _parse_line_amount(props.get("amount"))
 
     if current_sub_category == skip_sub_category and line_amount <= 0:
         return (
@@ -278,18 +382,20 @@ def _parse_hubspot_line_item(
 def process_deal_lineitems_change(
     hubspot_line_items: List[Dict[str, Any]],
 ) -> Union[List[Dict[str, Any]], bool]:
-    """Map HubSpot lines to NetSuite invoice rows; filter locally before SKU lookups."""
+    """Map HubSpot lines to NetSuite invoice rows; consolidate by SKU, then validate."""
     try:
         total = len(hubspot_line_items)
         logger.info("[lines] - Evaluating %s HubSpot line item(s)", total)
+        consolidated_items = _consolidate_line_items_by_sku(hubspot_line_items)
+        logger.info("[lines] - Consolidated to %s SKU group(s)", len(consolidated_items))
         skip_sub_category = str(HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY or "").strip().lower()
         eligible: List[Tuple[str, str, float, Dict[str, Any]]] = []
         skipped: List[Tuple[str, str, str]] = []
         skip_counts: Dict[str, int] = {}
 
-        for hubspot_line_item in hubspot_line_items:
+        for consolidated_line_item in consolidated_items:
             sku, name, amount, props, skip_reason = _parse_hubspot_line_item(
-                hubspot_line_item,
+                consolidated_line_item,
                 skip_sub_category,
             )
             if skip_reason:
@@ -334,7 +440,7 @@ def process_deal_lineitems_change(
             netsuite_item_id = netsuite_item.get("id")
             line: Dict[str, Any] = {
                 "item": {"id": netsuite_item_id},
-                "quantity": int(props.get("quantity") or 0),
+                "quantity": int(_parse_line_quantity(props.get("quantity"))),
                 "amount": line_amount,
                 "description": "",
                 "rate": float(props.get("price") or 0),
@@ -438,7 +544,6 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
             deal_id,
             properties=[
                 "dealname",
-                "dealstage",
                 "event_type",
                 "amount",
                 "venue",
@@ -630,7 +735,7 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
 
 
 def process_payment(webhook_data: Dict[str, Any]) -> bool:
-    """Payment sync is disabled. Preserved implementation is commented at end of this file."""
+    """Payment sync is disabled; acknowledge payment webhooks without processing."""
     logger.info(
         "[payment] - sync disabled; skipping objectId=%s subscriptionType=%s",
         webhook_data.get("objectId"),

@@ -200,8 +200,6 @@ class NetSuiteAuth:
                     response = requests.get(url, headers=headers, params=data)
                 elif method == 'POST':
                     response = requests.post(url, headers=headers, json=data)
-                elif method == 'PUT':
-                    response = requests.put(url, headers=headers, json=data)
                 elif method == 'PATCH':
                     response = requests.patch(url, headers=headers, json=data, timeout=1000, params=params)
                 else:
@@ -350,8 +348,6 @@ class NetSuiteAuth:
         response = self.make_request('GET', f'record/v1/invoice/{invoice_id}')
         return response.json()['tranId']
 
-    # Payment NetSuite helpers disabled — see commented block at end of file.
-
     def get_venue_by_external_id(self, external_id: str) -> str:
         """Get venue by external ID."""
         response = self.make_request('GET', 'record/v1/location', {'q': f'externalId IS "{external_id}"'})
@@ -489,28 +485,6 @@ class NetSuiteAuth:
         if missing:
             logger.warning("[NetSuite] Batch item lookup missing skus=%s", missing)
         return matched
-
-    def search_item_by_sku(self, sku: str = "") -> Optional[Dict[str, Any]]:
-        """Resolve a single NetSuite item by SKU (itemid)."""
-        normalized_sku = str(sku or "").strip()
-        if not normalized_sku:
-            logger.warning("[NetSuite] Missing SKU for item lookup")
-            return None
-
-        row = self.search_items_by_sku_batch([normalized_sku]).get(normalized_sku)
-        if row:
-            logger.info(
-                "[NetSuite] Item match by sku=%s netsuite_id=%s",
-                normalized_sku,
-                row.get("id"),
-            )
-            return row
-
-        logger.warning(
-            "[NetSuite] No item match for sku=%s",
-            normalized_sku,
-        )
-        return None
         
     def update_invoice_line_items(self, invoice_id: str, line_items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Replace all line items for a specific invoice.

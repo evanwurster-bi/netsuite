@@ -99,8 +99,16 @@ HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY = "Owned Equipment"
 # HubSpot venue custom object property internal name to store NetSuite location id after sync
 HUBSPOT_VENUE_NETSUITE_ID_PROPERTY = "netsuite_id"
 
-# HubSpot deal stage internal ID(s), comma-separated — same name as Lambda / SAM env var.
-HUBSPOT_DEAL_STAGE_SYNC_ID: str = (os.environ.get("HUBSPOT_DEAL_STAGE_SYNC_ID") or "").strip()
-HUBSPOT_DEAL_STAGE_SYNC_IDS: tuple[str, ...] = tuple(
-    s.strip() for s in HUBSPOT_DEAL_STAGE_SYNC_ID.split(",") if s.strip()
+def _parse_comma_separated_ids(raw: str) -> tuple[str, ...]:
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+# HubSpot deal stage internal ID(s) that may CREATE a NetSuite invoice (comma-separated).
+HUBSPOT_DEAL_STAGE_CREATE_IDS: tuple[str, ...] = _parse_comma_separated_ids(
+    os.environ.get("HUBSPOT_DEAL_STAGE_CREATE_ID") or ""
+)
+
+# HubSpot deal stage internal ID(s) that may UPDATE an existing invoice only (comma-separated).
+HUBSPOT_DEAL_STAGE_UPDATE_IDS: tuple[str, ...] = _parse_comma_separated_ids(
+    os.environ.get("HUBSPOT_DEAL_STAGE_UPDATE_ID") or ""
 )

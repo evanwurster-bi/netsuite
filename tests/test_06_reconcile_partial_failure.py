@@ -83,9 +83,6 @@ class FakeNetSuite:
     def search_items_by_sku_batch(self, skus):
         return {sku: {"id": "item-1"} for sku in skus}
 
-    def search_item_by_sku(self, sku):
-        return {"id": "item-1"}
-
     def create_or_update_invoice(self, invoice, invoice_id=None):
         self.create_calls += 1
         self.invoice_exists = True  # NetSuite committed
