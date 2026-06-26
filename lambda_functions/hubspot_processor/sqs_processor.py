@@ -61,8 +61,8 @@ _HUBSPOT_LINE_ITEM_PROPERTIES = (
 )
 
 
-# Configurable pause between HubSpot/NetSuite calls (see API_CALL_DELAY_SECONDS in template).
-_API_CALL_DELAY_SECONDS = float(os.getenv("API_CALL_DELAY_SECONDS", "0.5"))
+# Optional pause between HubSpot/NetSuite calls (see API_CALL_DELAY_SECONDS in template).
+_API_CALL_DELAY_SECONDS = float(os.getenv("API_CALL_DELAY_SECONDS", "0"))
 
 
 def _sleep_between_api_calls() -> None:
@@ -153,34 +153,31 @@ def _deal_stage_invoice_mode(stage: str) -> Optional[str]:
     return None
 
 
-def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
-    """
-    Gate deal-to-invoice processing by deal stage:
+def _deal_invoice_sync_properties() -> List[str]:
+    """HubSpot deal fields used by the invoice gate and reconcile path."""
+    return [
+        "prior_netsuite_invoice",
+        "dealstage",
+        "dealname",
+        "event_type",
+        "amount",
+        "venue",
+        "event_start_date_and_time",
+        DEAL_VENUE_NAME_PROPERTY,
+        "venue_netsuite_id",
+        "hubspot_owner_id",
+        "production_fee",
+        "netsuite_est_guest_count",
+        "netsuite_invoice_number",
+    ]
 
-    - All enabled stages require ``prior_netsuite_invoice = No``.
-    - Create stages (``HUBSPOT_DEAL_STAGE_CREATE_ID``): may create or re-sync an invoice.
-    - Update stages (``HUBSPOT_DEAL_STAGE_UPDATE_ID``): may update only when a NetSuite
-      invoice already exists for the deal.
-    """
-    deal_id = str(webhook_data.get("objectId", "")).strip()
-    if not deal_id:
-        logger.warning(
-            "[deal] - Missing objectId while evaluating deal stage; skipping invoice sync"
-        )
-        return False
 
-    hubspot_deal = hubspot.get_deal(
-        deal_id,
-        properties=["prior_netsuite_invoice", "dealstage"],
-    )
-    _sleep_between_api_calls()
-    if not hubspot_deal:
-        logger.warning(
-            "[deal] - Could not load deal %s to evaluate deal stage; skipping invoice sync",
-            deal_id,
-        )
-        return False
-
+def _deal_invoice_gate(
+    deal_id: str,
+    hubspot_deal: Dict[str, Any],
+    netsuite_invoice_id: Optional[str],
+) -> bool:
+    """Return True when the deal should sync to NetSuite (stage and prior-invoice gates)."""
     current_deal_stage = str((hubspot_deal.get("properties") or {}).get("dealstage", "")).strip()
     stage_mode = _deal_stage_invoice_mode(current_deal_stage)
     if stage_mode is None:
@@ -219,9 +216,6 @@ def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
         )
         return False
 
-    netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
-    _sleep_between_api_calls()
-
     if stage_mode == "update":
         if not netsuite_invoice_id:
             logger.info(
@@ -251,6 +245,35 @@ def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
         )
 
     return True
+
+
+def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
+    """
+    Gate deal-to-invoice processing by deal stage (standalone fetch for tests/tools).
+
+    The production path loads the deal once in ``process_deal_to_invoice`` and reuses it in
+    ``reconcile_deal_invoice``; this helper remains for unit tests of the gate rules.
+    """
+    deal_id = str(webhook_data.get("objectId", "")).strip()
+    if not deal_id:
+        logger.warning(
+            "[deal] - Missing objectId while evaluating deal stage; skipping invoice sync"
+        )
+        return False
+
+    hubspot_deal = hubspot.get_deal(
+        deal_id,
+        properties=["prior_netsuite_invoice", "dealstage"],
+    )
+    if not hubspot_deal:
+        logger.warning(
+            "[deal] - Could not load deal %s to evaluate deal stage; skipping invoice sync",
+            deal_id,
+        )
+        return False
+
+    netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+    return _deal_invoice_gate(deal_id, hubspot_deal, netsuite_invoice_id)
 
 
 def _is_venue_event(webhook_data: Dict[str, Any]) -> bool:
@@ -463,15 +486,37 @@ def process_deal_lineitems_change(
 
 
 def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
-    """Validate a deal webhook, then reconcile its NetSuite invoice."""
+    """Validate a deal webhook, apply stage gates, then reconcile its NetSuite invoice."""
     is_valid, error_message, deal_id = hubspot.validate_webhook_payload(webhook_data)
     if not is_valid:
         logger.error("Invalid webhook payload: %s", error_message)
         return False
-    return reconcile_deal_invoice(deal_id)
+
+    hubspot_deal = hubspot.get_deal(deal_id, properties=_deal_invoice_sync_properties())
+    if not hubspot_deal:
+        logger.warning(
+            "[deal] - Could not load deal %s to evaluate deal stage; skipping invoice sync",
+            deal_id,
+        )
+        return True
+
+    netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+    if not _deal_invoice_gate(deal_id, hubspot_deal, netsuite_invoice_id):
+        return True
+
+    return reconcile_deal_invoice(
+        deal_id,
+        hubspot_deal=hubspot_deal,
+        netsuite_invoice_id=netsuite_invoice_id,
+    )
 
 
-def reconcile_deal_invoice(deal_id: str) -> bool:
+def reconcile_deal_invoice(
+    deal_id: str,
+    *,
+    hubspot_deal: Optional[Dict[str, Any]] = None,
+    netsuite_invoice_id: Optional[str] = None,
+) -> bool:
     """Build and upsert the NetSuite invoice for *deal_id* from current HubSpot state.
 
     Idempotent: it re-reads the deal and all of its line items, so any trigger (deal change,
@@ -483,7 +528,6 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
     """
     try:
         logger.info("reconcile_deal_invoice: deal_id=%s", deal_id)
-        _sleep_between_api_calls()
 
         def _set_invoice_status(reason: str) -> None:
             _set_deal_invoice_status(deal_id, reason)
@@ -540,22 +584,10 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
             netsuite_customer_subsidiary_id,
         )
 
-        hubspot_deal = hubspot.get_deal(
-            deal_id,
-            properties=[
-                "dealname",
-                "event_type",
-                "amount",
-                "venue",
-                "event_start_date_and_time",
-                DEAL_VENUE_NAME_PROPERTY,
-                "venue_netsuite_id",
-                "hubspot_owner_id",
-                "production_fee",
-                "netsuite_est_guest_count",
-                "netsuite_invoice_number",
-            ],
-        )
+        if hubspot_deal is None:
+            hubspot_deal = hubspot.get_deal(deal_id, properties=_deal_invoice_sync_properties())
+        if not hubspot_deal:
+            raise RuntimeError(f"Could not load HubSpot deal {deal_id} for invoice reconcile")
 
         existing_invoice_number = (hubspot_deal.get("properties") or {}).get(
             "netsuite_invoice_number", ""
@@ -593,7 +625,8 @@ def reconcile_deal_invoice(deal_id: str) -> bool:
             except Exception:
                 logger.exception("Error resolving sales rep from deal owner")
 
-        netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+        if netsuite_invoice_id is None:
+            netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
         _sleep_between_api_calls()
 
         venue_name_prop = (hubspot_deal.get("properties") or {}).get(
@@ -968,8 +1001,6 @@ def _dispatch_webhook_message(webhook_data: Dict[str, Any]) -> bool:
     subscription_type = webhook_data.get("subscriptionType", "")
 
     if subscription_type in ("deal.propertyChange", "deal.creation"):
-        if not _should_process_deal_invoice(webhook_data):
-            return True
         return process_deal_to_invoice(webhook_data)
 
     if subscription_type in ("venue.creation", "venue.propertyChange"):

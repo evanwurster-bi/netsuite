@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
 import logging
+import time
 import requests
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,86 @@ def _parse_whole_number_field(raw: Any, field_label: str) -> int:
         )
     return int(number)
 
+
+def _hubspot_path_for_log(url: str) -> str:
+    if "api.hubapi.com" in url:
+        return url.split("api.hubapi.com", 1)[1].split("?")[0]
+    return url
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a numeric ``Retry-After`` header (seconds); HTTP-date form is ignored."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(seconds, 60.0))
+
+
 from config import (
     HUBSPOT_DEAL_BILLING_ASSOCIATION_LABEL,
     HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS,
     HUBSPOT_OBJECT_TYPE_VENUE,
     resolve_hubspot_api_key,
 )
+
+_VENUE_NAME_FIELDS = ("name", "venue_name")
+
+
+def _venue_exact_name_filter_groups(venue_name: str) -> List[Dict[str, Any]]:
+    return [
+        {
+            "filters": [
+                {"propertyName": "name", "operator": "EQ", "value": venue_name},
+            ]
+        },
+        {
+            "filters": [
+                {"propertyName": "venue_name", "operator": "EQ", "value": venue_name},
+            ]
+        },
+    ]
+
+
+def _venue_token_name_filter_groups(venue_name: str) -> List[Dict[str, Any]]:
+    return [
+        {
+            "filters": [
+                {"propertyName": "name", "operator": "CONTAINS_TOKEN", "value": venue_name},
+            ]
+        },
+        {
+            "filters": [
+                {
+                    "propertyName": "venue_name",
+                    "operator": "CONTAINS_TOKEN",
+                    "value": venue_name,
+                },
+            ]
+        },
+    ]
+
+
+def _pick_venue_from_results(
+    results: List[Dict[str, Any]],
+    *,
+    target_name_lower: str,
+    original_name: str,
+) -> Dict[str, Any] | None:
+    for result in results:
+        props = result.get("properties") or {}
+        for field in _VENUE_NAME_FIELDS:
+            candidate = str(props.get(field) or "").strip().lower()
+            if candidate and candidate == target_name_lower:
+                logger.info(
+                    "[HubSpot] Venue lowercase match for %r using field=%s",
+                    original_name,
+                    field,
+                )
+                return result
+    return None
 
 
 class HubSpotClient:
@@ -48,6 +123,80 @@ class HubSpotClient:
         version = api_version or self.default_api_version
         return f'https://api.hubapi.com/crm/{version}'
 
+    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """HTTP call with retries for HubSpot rate limiting (mirrors NetSuite ``make_request``)."""
+        max_retries = 3
+        retry_delay = 2
+        attempt = 0
+        response: Optional[requests.Response] = None
+
+        while attempt < max_retries:
+            try:
+                if method == "GET":
+                    response = requests.get(url, headers=self.headers, **kwargs)
+                elif method == "POST":
+                    response = requests.post(url, headers=self.headers, **kwargs)
+                elif method == "PATCH":
+                    response = requests.patch(url, headers=self.headers, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
+                path = _hubspot_path_for_log(url)
+                if response.status_code == 429:
+                    logger.warning(
+                        "[HubSpot] %s %s -> 429 (rate limit), retry %s/%s",
+                        method,
+                        path,
+                        attempt + 1,
+                        max_retries,
+                    )
+                elif response.ok:
+                    logger.info("[HubSpot] %s %s -> %s", method, path, response.status_code)
+                else:
+                    preview = (response.text or "")[:400].replace("\n", " ")
+                    logger.error(
+                        "[HubSpot] %s %s -> %s %s",
+                        method,
+                        path,
+                        response.status_code,
+                        preview,
+                    )
+
+                if response.status_code != 429:
+                    response.raise_for_status()
+                    return response
+
+                attempt += 1
+                if attempt < max_retries:
+                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                    sleep_time = (
+                        retry_after
+                        if retry_after is not None
+                        else retry_delay * (2 ** (attempt - 1))
+                    )
+                    logger.info(
+                        "[HubSpot] 429 backoff %.1fs (retry %s/%s)",
+                        sleep_time,
+                        attempt,
+                        max_retries,
+                    )
+                    time.sleep(sleep_time)
+                    continue
+
+                response.raise_for_status()
+
+            except requests.exceptions.RequestException as exc:
+                if attempt == max_retries - 1:
+                    raise exc
+                attempt += 1
+                time.sleep(retry_delay * (2 ** (attempt - 1)))
+
+        if response is None:
+            raise RuntimeError(f"HubSpot request {method} {url} produced no response")
+        if response.status_code == 429:
+            response.raise_for_status()
+        return response
+
     def get_contact(self, contact_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
         """Fetch contact details from HubSpot API."""
         base_url = self._get_base_url(api_version)
@@ -57,8 +206,7 @@ class HubSpotClient:
         if properties:
             url += f'?properties={",".join(properties)}'
         
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
         
         return response.json()
     
@@ -71,8 +219,7 @@ class HubSpotClient:
         if properties:
             url += f'?properties={",".join(properties)}'
         
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
         
         return response.json()
     
@@ -85,8 +232,7 @@ class HubSpotClient:
             'properties': properties
         }
 
-        response = requests.patch(url, headers=self.headers, json=update_data)
-        response.raise_for_status()
+        response = self._request("PATCH", url, json=update_data)
 
         return response.json()
 
@@ -96,58 +242,97 @@ class HubSpotClient:
         api_version: str = None,
         properties: List[str] = None,
     ) -> Dict[str, Any] | None:
-        """Fetch venue details from HubSpot API by name, optionally requesting specific properties."""
+        """Fetch a venue custom object by name (case-insensitive on ``name`` / ``venue_name``)."""
         if venue_name is None or not str(venue_name).strip():
             logger.info("[HubSpot] Venue search skipped (empty name)")
             return None
 
         normalized_name = str(venue_name).strip()
         target_name_lower = normalized_name.lower()
-        base_url = self._get_base_url(api_version)
-        url = f"{base_url}/objects/{HUBSPOT_OBJECT_TYPE_VENUE}/search"
         requested_properties = list(
             dict.fromkeys((properties or []) + ["name", "venue_name"])
         )
+
+        exact_match = self._search_venue_by_filters(
+            filter_groups=_venue_exact_name_filter_groups(normalized_name),
+            requested_properties=requested_properties,
+            target_name_lower=target_name_lower,
+            original_name=normalized_name,
+            api_version=api_version,
+            paginate=False,
+        )
+        if exact_match is not None:
+            return exact_match
+
+        token_match = self._search_venue_by_filters(
+            filter_groups=_venue_token_name_filter_groups(normalized_name),
+            requested_properties=requested_properties,
+            target_name_lower=target_name_lower,
+            original_name=normalized_name,
+            api_version=api_version,
+            paginate=True,
+        )
+        if token_match is not None:
+            return token_match
+
+        logger.info("[HubSpot] Venue not found by lowercase match name=%r", venue_name)
+        return None
+
+    def _search_venue_by_filters(
+        self,
+        *,
+        filter_groups: List[Dict[str, Any]],
+        requested_properties: List[str],
+        target_name_lower: str,
+        original_name: str,
+        api_version: str | None,
+        paginate: bool,
+    ) -> Dict[str, Any] | None:
         after: str | None = None
-        while True:
+        pages_read = 0
+        max_pages = 5 if paginate else 1
+
+        while pages_read < max_pages:
             body: Dict[str, Any] = {
-                "limit": 100,
+                "filterGroups": filter_groups,
                 "properties": requested_properties,
+                "limit": 100,
             }
             if after:
                 body["after"] = after
 
-            response = requests.post(url, headers=self.headers, json=body)
-            if not response.ok:
-                preview = (response.text or "")[:800]
-                logger.warning(
-                    "[HubSpot] Venue search failed objectType=%s status=%s body=%s",
-                    HUBSPOT_OBJECT_TYPE_VENUE,
-                    response.status_code,
-                    preview,
-                )
-            response.raise_for_status()
-            data = response.json()
-            results = data.get("results", [])
+            data = self._post_venue_search(body, api_version=api_version)
+            match = _pick_venue_from_results(
+                data.get("results", []),
+                target_name_lower=target_name_lower,
+                original_name=original_name,
+            )
+            if match is not None:
+                return match
 
-            for result in results:
-                props = result.get("properties") or {}
-                for field in ("name", "venue_name"):
-                    candidate = str(props.get(field) or "").strip().lower()
-                    if candidate and candidate == target_name_lower:
-                        logger.info(
-                            "[HubSpot] Venue lowercase match for %r using field=%s",
-                            venue_name,
-                            field,
-                        )
-                        return result
+            if not paginate:
+                return None
 
             after = (((data.get("paging") or {}).get("next") or {}).get("after"))
             if not after:
-                break
+                return None
+            pages_read += 1
 
-        logger.info("[HubSpot] Venue not found by lowercase match name=%r", venue_name)
+        logger.info(
+            "[HubSpot] Venue token search exhausted pagination for name=%r",
+            original_name,
+        )
         return None
+
+    def _post_venue_search(
+        self,
+        body: Dict[str, Any],
+        api_version: str | None = None,
+    ) -> Dict[str, Any]:
+        base_url = self._get_base_url(api_version)
+        url = f"{base_url}/objects/{HUBSPOT_OBJECT_TYPE_VENUE}/search"
+        response = self._request("POST", url, json=body)
+        return response.json()
     
     def get_venue_by_id(self, venue_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
         """Fetch venue details by ID from HubSpot API."""
@@ -158,8 +343,7 @@ class HubSpotClient:
         if properties:
             url += f'?properties={",".join(properties)}'
         
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
         
         return response.json()
     
@@ -173,8 +357,7 @@ class HubSpotClient:
             'properties': properties
         }
         
-        response = requests.patch(url, headers=self.headers, json=update_data)
-        response.raise_for_status()
+        response = self._request("PATCH", url, json=update_data)
         
         return response.json()
     
@@ -182,8 +365,7 @@ class HubSpotClient:
         """Return only the parent deal id for a line item (no deal fetch)."""
         base_url = self._get_base_url(api_version)
         url = f'{base_url}/objects/line_items/{line_item_id}/associations/deals'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
 
         deals = response.json().get('results', [])
         return str(deals[0]['id']) if deals else None
@@ -192,8 +374,7 @@ class HubSpotClient:
         """Fetch the contacts associated with a deal."""
         base_url = self._get_base_url(api_version)
         url = f'{base_url}/objects/deals/{deal_id}/associations/contacts'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
         return response.json().get('results', [])
     
     def get_deal_billing_contact_or_default_contact(self, deal_id: str) -> Dict[str, Any]:
@@ -224,8 +405,7 @@ class HubSpotClient:
         """Fetch line items for a specific deal."""
         base_url = self._get_base_url(api_version)
         url = f'{base_url}/objects/deals/{deal_id}/associations/line_items'
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
         
         return response.json().get('results', [])
 
@@ -251,8 +431,7 @@ class HubSpotClient:
                 "properties": props,
                 "inputs": [{"id": line_item_id} for line_item_id in chunk],
             }
-            response = requests.post(url, headers=self.headers, json=payload)
-            response.raise_for_status()
+            response = self._request("POST", url, json=payload)
             results.extend(response.json().get("results", []))
 
         return results
@@ -387,7 +566,6 @@ class HubSpotClient:
         base_url = "https://api.hubapi.com"
         url = f'{base_url}/crm/v3/owners/{owner_id}'
         
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        response = self._request("GET", url)
         
         return response.json()
