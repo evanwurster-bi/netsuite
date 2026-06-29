@@ -19,6 +19,7 @@ from config import (
     HUBSPOT_OBJECT_TYPE_VENUE,
     HUBSPOT_VENUE_NETSUITE_ID_PROPERTY,
 )
+from cache import TTLCache
 from hubspot import DealInvoiceRejected, HubSpotClient
 from locks import (
     consume_pending_resync,
@@ -35,6 +36,11 @@ logger.setLevel(logging.INFO)
 
 netsuite = NetSuiteAuth()
 hubspot = HubSpotClient()
+
+# Caches for lookups that rarely change, to skip repeat round-trips. They live on these
+# module-level instances, so they survive across warm Lambda invocations.
+_SUBSIDIARY_CACHE = TTLCache(float(os.getenv("SUBSIDIARY_CACHE_TTL_SECONDS", "300")))
+_SALES_REP_CACHE = TTLCache(float(os.getenv("SALES_REP_CACHE_TTL_SECONDS", "300")))
 
 NETSUITE_SUBSIDIARY_ID = os.environ["NETSUITE_SUBSIDIARY_ID"]
 WEBHOOK_OBJECT_ID_FILTER_ENABLED = os.getenv(
@@ -104,6 +110,29 @@ def _read_back(fetch, *, attempts: int = 5, delay: float = 1.0):
         if attempt < attempts - 1:
             time.sleep(delay)
     return result
+
+
+def _resolve_sales_rep_id(hubspot_owner_id: str) -> Optional[str]:
+    """Map a HubSpot owner id to a NetSuite employee (sales rep) id, or None.
+
+    Two round-trips (HubSpot owner -> email -> NetSuite employee); the result is cached by
+    owner id because the mapping rarely changes (see _SALES_REP_CACHE).
+    """
+    hubspot_owner = hubspot.get_owner_by_id(hubspot_owner_id)
+    if not hubspot_owner:
+        logger.warning("HubSpot owner %s not found", hubspot_owner_id)
+        return None
+    owner_email = hubspot_owner.get("email")
+    if not owner_email:
+        logger.warning("HubSpot owner %s has no email", hubspot_owner_id)
+        return None
+    netsuite_employee = netsuite.search_employee_by_email(owner_email)
+    if not netsuite_employee:
+        logger.warning("No NetSuite employee for owner email %s", owner_email)
+        return None
+    sales_rep_id = netsuite_employee.get("id")
+    logger.info("Mapped HubSpot owner %s to NetSuite employee %s", owner_email, sales_rep_id)
+    return sales_rep_id
 
 
 def _now_hubspot_datetime_ms() -> str:
@@ -599,7 +628,10 @@ def reconcile_deal_invoice(
 
         netsuite_customer_id = netsuite_customer.get("id")
 
-        customer_subsidiaries = netsuite.get_customer_subsidiaries(netsuite_customer_id)
+        customer_subsidiaries = _SUBSIDIARY_CACHE.get_or_compute(
+            str(netsuite_customer_id),
+            lambda: netsuite.get_customer_subsidiaries(netsuite_customer_id),
+        )
         _sleep_between_api_calls()
         allowed_subsidiary_ids = {
             str(row.get("subsidiary")) for row in customer_subsidiaries
@@ -645,30 +677,14 @@ def reconcile_deal_invoice(
         hubspot_owner_id = (hubspot_deal.get("properties") or {}).get("hubspot_owner_id")
         if hubspot_owner_id:
             try:
-                hubspot_owner = hubspot.get_owner_by_id(hubspot_owner_id)
-                _sleep_between_api_calls()
-                if hubspot_owner:
-                    owner_email = hubspot_owner.get("email")
-                    if owner_email:
-                        netsuite_employee = netsuite.search_employee_by_email(owner_email)
-                        _sleep_between_api_calls()
-                        if netsuite_employee:
-                            netsuite_sales_rep_id = netsuite_employee.get("id")
-                            logger.info(
-                                "Mapped HubSpot owner %s to NetSuite employee %s",
-                                owner_email,
-                                netsuite_sales_rep_id,
-                            )
-                        else:
-                            logger.warning(
-                                "No NetSuite employee for owner email %s",
-                                owner_email,
-                            )
-                    else:
-                        logger.warning("HubSpot owner %s has no email", hubspot_owner_id)
-                else:
-                    logger.warning("HubSpot owner %s not found", hubspot_owner_id)
+                # Cached by owner id (owner -> employee mapping rarely changes), so a cache
+                # hit skips both the HubSpot owner and NetSuite employee round-trips.
+                netsuite_sales_rep_id = _SALES_REP_CACHE.get_or_compute(
+                    str(hubspot_owner_id),
+                    lambda: _resolve_sales_rep_id(str(hubspot_owner_id)),
+                )
             except Exception:
+                # Sales rep is best-effort — never fail the whole deal over it.
                 logger.exception("Error resolving sales rep from deal owner")
 
         if netsuite_invoice_id is None:
@@ -1112,7 +1128,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "HubSpot webhook payload: %s",
                     json.dumps(item, separators=(",", ":"), default=str),
                 )
-                if not process_webhook_message(item):
+                started = time.time()
+                handled = process_webhook_message(item)
+                elapsed = time.time() - started
+                logger.info(
+                    "[event] objectId=%s subscriptionType=%s -> %s in %.1fs",
+                    item.get("objectId"),
+                    item.get("subscriptionType"),
+                    "ok" if handled else "rejected",
+                    elapsed,
+                )
+                if not handled:
                     # Permanent business rejection (bad/missing data, no contact, …): ACK it —
                     # retrying cannot help — but log it loudly so it is immediately visible.
                     # The handler also records the reason on the deal (netsuite_invoice_status).

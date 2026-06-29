@@ -44,7 +44,7 @@ def test_token_is_cached_across_calls(monkeypatch):
         def json(self):
             return {"access_token": "tok", "expires_in": 3600}
 
-    def fake_post(url, data=None, headers=None):
+    def fake_post(url, data=None, headers=None, timeout=None):
         calls["n"] += 1
         return Resp()
 
