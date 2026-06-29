@@ -12,6 +12,20 @@ from config import resolve_netsuite_oauth_credentials
 
 logger = logging.getLogger(__name__)
 
+# (connect, read) timeouts so a slow or hung NetSuite call fails fast and is retried,
+# instead of stalling the whole invocation (the old code had no GET/POST timeout and a
+# 1000s PATCH timeout). Configurable via env.
+_HTTP_TIMEOUT = (
+    float(os.getenv("NETSUITE_CONNECT_TIMEOUT_SECONDS", "5")),
+    float(os.getenv("NETSUITE_READ_TIMEOUT_SECONDS", "30")),
+)
+
+
+def _elapsed_ms(response) -> int:
+    """Round-trip duration of a response in ms (for timing logs); -1 if unavailable."""
+    elapsed = getattr(response, "elapsed", None)
+    return int(elapsed.total_seconds() * 1000) if elapsed is not None else -1
+
 
 def _netsuite_path_for_log(url: str) -> str:
     """Short path for logs (no query string secrets)."""
@@ -170,8 +184,18 @@ class NetSuiteAuth:
                 "client_assertion": assertion,
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_HTTP_TIMEOUT,
         )
-        response.raise_for_status()
+        elapsed_ms = _elapsed_ms(response)
+        status = getattr(response, "status_code", "?")
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError:
+            # Surface NetSuite's reason (e.g. {"error":"invalid_client"}) — raise_for_status hides it.
+            preview = (getattr(response, "text", "") or "")[:500].replace("\n", " ")
+            logger.error("[NetSuite] POST auth/oauth2/v1/token -> %s in %sms %s", status, elapsed_ms, preview)
+            raise
+        logger.info("[NetSuite] POST auth/oauth2/v1/token -> %s in %sms", status, elapsed_ms)
         payload = response.json()
         self._access_token = payload["access_token"]
         self._access_token_expiry = now + float(payload.get("expires_in", 3600))
@@ -197,32 +221,35 @@ class NetSuiteAuth:
                     headers.update(additional_headers)
 
                 if method == 'GET':
-                    response = requests.get(url, headers=headers, params=data)
+                    response = requests.get(url, headers=headers, params=data, timeout=_HTTP_TIMEOUT)
                 elif method == 'POST':
-                    response = requests.post(url, headers=headers, json=data)
+                    response = requests.post(url, headers=headers, json=data, timeout=_HTTP_TIMEOUT)
                 elif method == 'PATCH':
-                    response = requests.patch(url, headers=headers, json=data, timeout=1000, params=params)
+                    response = requests.patch(url, headers=headers, json=data, params=params, timeout=_HTTP_TIMEOUT)
                 else:
                     raise ValueError(f"Unsupported HTTP method: {method}")
 
                 path = _netsuite_path_for_log(url)
+                elapsed_ms = _elapsed_ms(response)
                 if response.status_code == 429:
                     logger.warning(
-                        "[NetSuite] %s %s -> 429 (rate limit), retry %s/%s",
+                        "[NetSuite] %s %s -> 429 (rate limit) in %sms, retry %s/%s",
                         method,
                         path,
+                        elapsed_ms,
                         attempt + 1,
                         max_retries,
                     )
                 elif response.ok:
-                    logger.info("[NetSuite] %s %s -> %s", method, path, response.status_code)
+                    logger.info("[NetSuite] %s %s -> %s in %sms", method, path, response.status_code, elapsed_ms)
                 else:
                     preview = (response.text or "")[:400].replace("\n", " ")
                     logger.error(
-                        "[NetSuite] %s %s -> %s %s",
+                        "[NetSuite] %s %s -> %s in %sms %s",
                         method,
                         path,
                         response.status_code,
+                        elapsed_ms,
                         preview,
                     )
 

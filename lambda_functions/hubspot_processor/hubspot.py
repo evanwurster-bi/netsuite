@@ -1,10 +1,23 @@
 from datetime import datetime, timezone
 import logging
+import os
 import time
 import requests
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# (connect, read) timeouts so a slow/hung HubSpot call fails fast and is retried.
+_HTTP_TIMEOUT = (
+    float(os.getenv("HUBSPOT_CONNECT_TIMEOUT_SECONDS", "5")),
+    float(os.getenv("HUBSPOT_READ_TIMEOUT_SECONDS", "30")),
+)
+
+
+def _elapsed_ms(response) -> int:
+    """Round-trip duration of a response in ms (for timing logs); -1 if unavailable."""
+    elapsed = getattr(response, "elapsed", None)
+    return int(elapsed.total_seconds() * 1000) if elapsed is not None else -1
 
 
 class DealInvoiceRejected(ValueError):
@@ -126,6 +139,7 @@ class HubSpotClient:
 
         while attempt < max_retries:
             try:
+                kwargs.setdefault("timeout", _HTTP_TIMEOUT)
                 if method == "GET":
                     response = requests.get(url, headers=self.headers, **kwargs)
                 elif method == "POST":
@@ -136,23 +150,26 @@ class HubSpotClient:
                     raise ValueError(f"Unsupported HTTP method: {method}")
 
                 path = _hubspot_path_for_log(url)
+                elapsed_ms = _elapsed_ms(response)
                 if response.status_code == 429:
                     logger.warning(
-                        "[HubSpot] %s %s -> 429 (rate limit), retry %s/%s",
+                        "[HubSpot] %s %s -> 429 (rate limit) in %sms, retry %s/%s",
                         method,
                         path,
+                        elapsed_ms,
                         attempt + 1,
                         max_retries,
                     )
                 elif response.ok:
-                    logger.info("[HubSpot] %s %s -> %s", method, path, response.status_code)
+                    logger.info("[HubSpot] %s %s -> %s in %sms", method, path, response.status_code, elapsed_ms)
                 else:
                     preview = (response.text or "")[:400].replace("\n", " ")
                     logger.error(
-                        "[HubSpot] %s %s -> %s %s",
+                        "[HubSpot] %s %s -> %s in %sms %s",
                         method,
                         path,
                         response.status_code,
+                        elapsed_ms,
                         preview,
                     )
 
