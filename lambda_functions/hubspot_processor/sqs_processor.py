@@ -20,7 +20,12 @@ from config import (
     HUBSPOT_VENUE_NETSUITE_ID_PROPERTY,
 )
 from hubspot import DealInvoiceRejected, HubSpotClient
-from locks import deal_lock
+from locks import (
+    consume_pending_resync,
+    mark_pending_resync,
+    release_lock,
+    try_acquire,
+)
 from netsuite_auth import NetSuiteAuth
 
 logger = logging.getLogger(__name__)
@@ -511,6 +516,47 @@ def process_deal_to_invoice(webhook_data: Dict[str, Any]) -> bool:
     )
 
 
+def _sync_deal_by_id(deal_id: str) -> bool:
+    """Reconcile a Deal invoice from current HubSpot state (no webhook payload)."""
+    hubspot_deal = hubspot.get_deal(deal_id, properties=_deal_invoice_sync_properties())
+    if not hubspot_deal:
+        logger.warning(
+            "[deal] - Could not load deal %s for follow-up reconcile; skipping",
+            deal_id,
+        )
+        return True
+
+    netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
+    if not _deal_invoice_gate(deal_id, hubspot_deal, netsuite_invoice_id):
+        return True
+
+    return reconcile_deal_invoice(
+        deal_id,
+        hubspot_deal=hubspot_deal,
+        netsuite_invoice_id=netsuite_invoice_id,
+    )
+
+
+def _reconcile_lock_key(lock_key: str) -> bool:
+    """Full state reconcile for the entity serialized under *lock_key*."""
+    if lock_key.startswith("venue:"):
+        venue_id = lock_key.split(":", 1)[1]
+        return process_venue(
+            {
+                "objectId": venue_id,
+                "subscriptionType": "venue.propertyChange",
+            }
+        )
+    return _sync_deal_by_id(lock_key)
+
+
+def _drain_pending_resync(lock_key: str, token: str) -> None:
+    """Run follow-up reconciles while coalesced webhooks set pending_resync during reconcile."""
+    while consume_pending_resync(lock_key, token):
+        logger.info("[resync] follow-up reconcile lock_key=%s", lock_key)
+        _reconcile_lock_key(lock_key)
+
+
 def reconcile_deal_invoice(
     deal_id: str,
     *,
@@ -972,10 +1018,8 @@ def _resolve_lock_key(webhook_data: Dict[str, Any]) -> Optional[str]:
 def process_webhook_message(webhook_data: Dict[str, Any]) -> bool:
     """Serialize per parent deal, then route the event to the right handler.
 
-    The per-deal lock guarantees concurrent deal / line-item events for the same
-    invoice run one at a time which, together with the reconcile-from-state handlers,
-    prevents duplicate invoices and NetSuite "Record has been changed" errors. If the lock
-    is held by another worker, ``deal_lock`` raises and the SQS message is retried later.
+    Contending workers coalesce: they set ``pending_resync`` and ack without SQS retry.
+    The lock holder drains pending flags with follow-up reconciles before release.
     """
     is_venue_event = _is_venue_event(webhook_data)
     if _is_payment_webhook(webhook_data):
@@ -992,8 +1036,18 @@ def process_webhook_message(webhook_data: Dict[str, Any]) -> bool:
         )
         return True
 
-    with deal_lock(lock_key):
-        return _dispatch_webhook_message(webhook_data)
+    acquired, token = try_acquire(lock_key)
+    if not acquired:
+        mark_pending_resync(lock_key)
+        logger.info("[coalesced] lock busy key=%s; pending_resync set", lock_key)
+        return True
+
+    try:
+        result = _dispatch_webhook_message(webhook_data)
+        _drain_pending_resync(lock_key, token)
+        return result
+    finally:
+        release_lock(lock_key, token)
 
 
 def _dispatch_webhook_message(webhook_data: Dict[str, Any]) -> bool:
@@ -1040,8 +1094,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     * handler returns ``False`` -> permanent business rejection (e.g. no billing contact)
       -> acked (retrying cannot help) but logged loudly as ``[rejected] ...`` and recorded
       on the deal via ``netsuite_invoice_status``, so it is visible immediately.
-    * processing raises         -> transient error (lock contention, NetSuite 5xx, network)
+    * processing raises         -> transient error (NetSuite 5xx, network, HubSpot after retries)
       -> reported in ``batchItemFailures`` so SQS redrives it, reaching the DLQ if it persists.
+    * lock busy                 -> ``pending_resync`` set, message acked (not a failure).
     """
     records = event.get("Records", [])
     logger.info("SQS records: %s", len(records))

@@ -47,6 +47,11 @@ Parameters:
     Default: "venue_name_"
     Description: HubSpot deal property internal name used to resolve venue name for invoice sync.
 
+  HubSpotVenueNameSearchProperties:
+    Type: String
+    Default: "name,venue_name"
+    Description: Venue custom-object property internal names for CRM search filters (comma-separated).
+
   WebhookObjectIdFilterEnabled:
     Type: String
     Default: "false"
@@ -215,6 +220,7 @@ Resources:
           HUBSPOT_OBJECT_TYPE_PAYMENT: !Ref HubSpotObjectTypePayment
           HUBSPOT_OBJECT_TYPE_LINE_ITEM: !Ref HubSpotObjectTypeLineItem
           DEAL_VENUE_NAME_PROPERTY: !Ref DealVenueNameProperty
+          HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES: !Ref HubSpotVenueNameSearchProperties
           WEBHOOK_OBJECT_ID_FILTER_ENABLED: !Ref WebhookObjectIdFilterEnabled
           WEBHOOK_OBJECT_ID_FILTER_VALUE: !Ref WebhookObjectIdFilterValue
           NETSUITE_ACCOUNT_ID: !Ref NetSuiteAccountId

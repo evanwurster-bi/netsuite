@@ -78,6 +78,10 @@ def _env(key: str, default: str) -> str:
     return str(v).strip()
 
 
+def _parse_comma_separated_ids(raw: str) -> tuple[str, ...]:
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
 # HubSpot object type IDs (webhook objectTypeId)
 HUBSPOT_OBJECT_TYPE_VENUE = _env("HUBSPOT_OBJECT_TYPE_VENUE", "2-47163024")
 HUBSPOT_OBJECT_TYPE_PAYMENT = _env("HUBSPOT_OBJECT_TYPE_PAYMENT", "0-101")
@@ -90,6 +94,13 @@ HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS: frozenset[str] = frozenset(
 # Deal property internal name used to resolve venue name for invoices.
 DEAL_VENUE_NAME_PROPERTY = _env("DEAL_VENUE_NAME_PROPERTY", "venu_name_sync")
 
+# Venue custom-object property internal names used in CRM search filters (comma-separated).
+HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES: tuple[str, ...] = _parse_comma_separated_ids(
+    os.environ.get("HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES") or "name,venue_name"
+)
+if not HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES:
+    HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES = ("name",)
+
 # Deal–contact association label used to pick billing contact
 HUBSPOT_DEAL_BILLING_ASSOCIATION_LABEL = "Billing"
 
@@ -98,10 +109,6 @@ HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY = "Owned Equipment"
 
 # HubSpot venue custom object property internal name to store NetSuite location id after sync
 HUBSPOT_VENUE_NETSUITE_ID_PROPERTY = "netsuite_id"
-
-def _parse_comma_separated_ids(raw: str) -> tuple[str, ...]:
-    return tuple(s.strip() for s in raw.split(",") if s.strip())
-
 
 # HubSpot deal stage internal ID(s) that may CREATE a NetSuite invoice (comma-separated).
 HUBSPOT_DEAL_STAGE_CREATE_IDS: tuple[str, ...] = _parse_comma_separated_ids(

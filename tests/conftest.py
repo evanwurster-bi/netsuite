@@ -45,8 +45,8 @@ os.environ.setdefault(
 
 
 class FakeLockTable:
-    """In-memory stand-in for the DynamoDB lock table honoring the two ConditionExpressions
-    locks.py uses: acquire-if-free-or-expired, and delete-only-if-owner."""
+    """In-memory stand-in for the DynamoDB lock table honoring the ConditionExpressions
+    locks.py uses: acquire-if-free-or-expired, delete-only-if-owner, pending_resync updates."""
 
     def __init__(self):
         self.items = {}
@@ -57,7 +57,39 @@ class FakeLockTable:
         cur = self.items.get(key)
         if cur is not None and cur["expiresAt"] >= now:
             raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
-        self.items[key] = Item
+        self.items[key] = dict(Item)
+
+    def update_item(
+        self,
+        Key,
+        UpdateExpression=None,
+        ConditionExpression=None,
+        ExpressionAttributeNames=None,
+        ExpressionAttributeValues=None,
+    ):
+        key = Key["deal_id"]
+        cur = self.items.get(key)
+        values = ExpressionAttributeValues or {}
+        names = ExpressionAttributeNames or {}
+
+        if ConditionExpression:
+            if "attribute_exists(deal_id)" in ConditionExpression and cur is None:
+                raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+            owner_key = names.get("#owner", "owner")
+            if "#owner = :token" in ConditionExpression:
+                if cur is None or cur.get(owner_key) != values.get(":token"):
+                    raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+            if "pending_resync = :true" in ConditionExpression:
+                if cur is None or not cur.get("pending_resync"):
+                    raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+
+        if cur is None:
+            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+
+        if UpdateExpression == "SET pending_resync = :true":
+            cur["pending_resync"] = values[":true"]
+        elif UpdateExpression == "SET pending_resync = :false":
+            cur["pending_resync"] = values[":false"]
 
     def delete_item(
         self,

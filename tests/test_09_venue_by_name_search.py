@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from hubspot import HubSpotClient, _venue_exact_name_filter_groups, _venue_token_name_filter_groups
+import pytest
+import requests
+
+from hubspot import DealInvoiceRejected, HubSpotClient, _venue_exact_name_filter_groups, _venue_token_name_filter_groups
 
 
 class RecordingHubSpotClient(HubSpotClient):
@@ -68,3 +71,23 @@ def test_empty_name_skips_search():
     assert client.get_venue_by_name("") is None
     assert client.get_venue_by_name("   ") is None
     assert client.search_calls == []
+
+
+def test_venue_search_400_raises_deal_invoice_rejected():
+    class BadSearchClient(HubSpotClient):
+        def __init__(self):
+            self.api_key = "test-key"
+            self.default_api_version = "v3"
+            self.headers = {}
+
+        def _request(self, method, url, **kwargs):
+            response = requests.Response()
+            response.status_code = 400
+            response._content = b'{"status":"error","message":"There was a problem with the request."}'
+            response.url = url
+            response.request = requests.Request(method, url).prepare()
+            response.raise_for_status()
+
+    client = BadSearchClient()
+    with pytest.raises(DealInvoiceRejected):
+        client.get_venue_by_name("Some Venue")

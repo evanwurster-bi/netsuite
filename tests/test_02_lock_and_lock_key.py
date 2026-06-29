@@ -19,11 +19,13 @@ def test_acquire_then_release(fake_lock_table):
     assert "deal-1" not in fake_lock_table.items
 
 
-def test_contention_raises_lock_not_acquired(fake_lock_table):
-    with locks.deal_lock("deal-1"):
-        with pytest.raises(locks.LockNotAcquired):
-            with locks.deal_lock("deal-1"):  # second holder for same deal
-                pass
+def test_contention_marks_pending_resync(fake_lock_table):
+    acquired, token = locks.try_acquire("deal-1")
+    assert acquired
+    assert not locks.try_acquire("deal-1")[0]
+    locks.mark_pending_resync("deal-1")
+    assert fake_lock_table.items["deal-1"]["pending_resync"] is True
+    locks.release_lock("deal-1", token)
 
 
 def test_different_deals_do_not_block(fake_lock_table):

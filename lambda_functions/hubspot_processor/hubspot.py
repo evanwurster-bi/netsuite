@@ -47,43 +47,36 @@ from config import (
     HUBSPOT_DEAL_BILLING_ASSOCIATION_LABEL,
     HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS,
     HUBSPOT_OBJECT_TYPE_VENUE,
+    HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES,
     resolve_hubspot_api_key,
 )
 
-_VENUE_NAME_FIELDS = ("name", "venue_name")
 
-
-def _venue_exact_name_filter_groups(venue_name: str) -> List[Dict[str, Any]]:
+def _venue_exact_name_filter_groups(
+    venue_name: str,
+    fields: tuple[str, ...] = HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES,
+) -> List[Dict[str, Any]]:
     return [
         {
             "filters": [
-                {"propertyName": "name", "operator": "EQ", "value": venue_name},
+                {"propertyName": field, "operator": "EQ", "value": venue_name},
             ]
-        },
-        {
-            "filters": [
-                {"propertyName": "venue_name", "operator": "EQ", "value": venue_name},
-            ]
-        },
+        }
+        for field in fields
     ]
 
 
-def _venue_token_name_filter_groups(venue_name: str) -> List[Dict[str, Any]]:
+def _venue_token_name_filter_groups(
+    venue_name: str,
+    fields: tuple[str, ...] = HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES,
+) -> List[Dict[str, Any]]:
     return [
         {
             "filters": [
-                {"propertyName": "name", "operator": "CONTAINS_TOKEN", "value": venue_name},
+                {"propertyName": field, "operator": "CONTAINS_TOKEN", "value": venue_name},
             ]
-        },
-        {
-            "filters": [
-                {
-                    "propertyName": "venue_name",
-                    "operator": "CONTAINS_TOKEN",
-                    "value": venue_name,
-                },
-            ]
-        },
+        }
+        for field in fields
     ]
 
 
@@ -92,10 +85,11 @@ def _pick_venue_from_results(
     *,
     target_name_lower: str,
     original_name: str,
+    name_fields: tuple[str, ...] = HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES,
 ) -> Dict[str, Any] | None:
     for result in results:
         props = result.get("properties") or {}
-        for field in _VENUE_NAME_FIELDS:
+        for field in name_fields:
             candidate = str(props.get(field) or "").strip().lower()
             if candidate and candidate == target_name_lower:
                 logger.info(
@@ -249,8 +243,9 @@ class HubSpotClient:
 
         normalized_name = str(venue_name).strip()
         target_name_lower = normalized_name.lower()
+        name_fields = HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES
         requested_properties = list(
-            dict.fromkeys((properties or []) + ["name", "venue_name"])
+            dict.fromkeys((properties or []) + list(name_fields))
         )
 
         exact_match = self._search_venue_by_filters(
@@ -306,6 +301,7 @@ class HubSpotClient:
                 data.get("results", []),
                 target_name_lower=target_name_lower,
                 original_name=original_name,
+                name_fields=HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES,
             )
             if match is not None:
                 return match
@@ -331,8 +327,23 @@ class HubSpotClient:
     ) -> Dict[str, Any]:
         base_url = self._get_base_url(api_version)
         url = f"{base_url}/objects/{HUBSPOT_OBJECT_TYPE_VENUE}/search"
-        response = self._request("POST", url, json=body)
-        return response.json()
+        try:
+            response = self._request("POST", url, json=body)
+            return response.json()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 400:
+                preview = (exc.response.text or "")[:400].replace("\n", " ")
+                logger.error(
+                    "[HubSpot] venue search 400 objectType=%s filters=%s response=%s",
+                    HUBSPOT_OBJECT_TYPE_VENUE,
+                    body.get("filterGroups"),
+                    preview,
+                )
+                raise DealInvoiceRejected(
+                    "Not synced: HubSpot venue search rejected the query "
+                    "(check HUBSPOT_OBJECT_TYPE_VENUE and HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES)"
+                ) from exc
+            raise
     
     def get_venue_by_id(self, venue_id: str, api_version: str = None, properties: List[str] = None) -> Dict[str, Any]:
         """Fetch venue details by ID from HubSpot API."""
