@@ -172,19 +172,18 @@ logs:
 ## Deploy & verify
 
 ```bash
-# from the sandbox/ folder — reliability E2E uses the parallel -reliability stacks
+# from the sandbox/ folder
 sam validate --lint
-sam build  --config-file "samconfig accounts/reliability/duvall.toml"
-sam deploy --config-file "samconfig accounts/reliability/duvall.toml"
+sam build  --config-file "samconfig accounts/duvall.toml"
+sam deploy --config-file "samconfig accounts/duvall.toml"
 ```
 
-Regular sandbox stacks use `samconfig accounts/sandbox/{account}.toml`. Both folders share the
-same `template.yaml`; only stack name and S3 prefix differ. See
-[samconfig accounts/README.md](samconfig%20accounts/README.md).
+Replace `duvall` with `bestimpressions` or `rockytop`. See
+[samconfig accounts/README.md](samconfig%20accounts/README.md) for shared vs per-account settings.
 
-Roll out **sandbox → Duvall → Best Impressions → Rocky Top**, watching the DLQ alarm after
-each. Deploy via `samconfig accounts/sandbox/{account}.toml` once validation is complete, then
-delete the `-reliability` stacks.
+Roll out **Duvall → Best Impressions → Rocky Top**, watching the DLQ alarm after each.
+When validation is complete, promote the same template to the primary sandbox stacks and retire
+the `-reliability` stacks if they are no longer needed.
 
 ### What was tested locally
 - `py_compile` on all changed modules.

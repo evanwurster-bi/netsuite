@@ -30,6 +30,36 @@ def test_retry_after_none():
     assert na._parse_retry_after(None) is None
 
 
+def test_netsuite_client_error_detail_parses_o_error_details():
+    class Resp:
+        status_code = 400
+
+        @staticmethod
+        def json():
+            return {
+                "o:errorDetails": [
+                    {
+                        "detail": "Error while accessing a resource. You have entered an Invalid Field Value 22175 for the following field: salesrep.",
+                        "o:errorCode": "USER_ERROR",
+                    }
+                ]
+            }
+
+        text = ""
+
+    detail = na.netsuite_client_error_detail(Resp())
+    assert "22175" in detail
+    assert "salesrep" in detail
+
+
+def test_netsuite_client_error_detail_returns_none_for_non_400():
+    class Resp:
+        status_code = 502
+        text = "Bad Gateway"
+
+    assert na.netsuite_client_error_detail(Resp()) is None
+
+
 # --- Token caching (scenario 06) -----------------------------------------------------------
 
 def test_token_is_cached_across_calls(monkeypatch):

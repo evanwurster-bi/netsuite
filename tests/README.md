@@ -28,7 +28,8 @@ a throwaway EC key so the modules import without real credentials.
 | `test_04_netsuite_auth.py` | 06, 03 | `Retry-After` parsing; token cached + refresh on expiry; duplicate-`externalId` POST recovers via PATCH; runtime secret resolution |
 | `test_05_mapping_null_date.py` | 09 | missing/malformed `event_start_date_and_time` omits `tranDate` (no crash); valid date set |
 | `test_06_reconcile_partial_failure.py` | 05 | happy path; writeback failure raises (retryable) with invoice already committed; retry does not duplicate; failed upsert never stamps the deal |
-| `test_07_line_item_filter.py` | — | local line-item filters run before NetSuite SKU lookups; skip summary for ineligible SKUs |
+| `test_07_line_item_filter.py` | — | per-line filters before NetSuite SKU lookup; duplicate SKUs stay separate invoice rows |
+| `test_13_line_item_deal_id.py` | 04 | parent deal resolved via HubSpot v4 line-item associations |
 
 ## What these unit tests do *not* cover
 
@@ -45,8 +46,8 @@ Run SQS + DynamoDB locally and drive `lambda_handler` against them to verify the
 
 Deploy an **independent** sandbox stack and validate against real HubSpot/NetSuite sandboxes:
 
-1. `sam validate --lint && sam build && sam deploy --config-file "samconfig accounts/reliability/duvall.toml"`
-   (parallel `-reliability` stack; see `samconfig accounts/README.md`).
+1. `sam validate --lint && sam build && sam deploy --config-file "samconfig accounts/duvall.toml"`
+   (reliability stack; see `samconfig accounts/README.md`).
 2. **Batch (01):** POST a webhook body containing an array of several events → confirm one SQS
    message per event and all syncs applied.
 3. **Retry/DLQ (02):** point at an invalid NetSuite cred briefly (or force a 5xx) → confirm the

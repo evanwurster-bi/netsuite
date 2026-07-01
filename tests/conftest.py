@@ -107,7 +107,7 @@ class FakeLockTable:
 
 @pytest.fixture
 def fake_lock_table(monkeypatch):
-    """Point locks._table at an in-memory fake so deal_lock works without DynamoDB."""
+    """Point locks._table at an in-memory fake so try_acquire works without DynamoDB."""
     import locks
 
     table = FakeLockTable()

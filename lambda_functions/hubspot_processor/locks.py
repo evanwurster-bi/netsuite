@@ -18,8 +18,6 @@ import logging
 import os
 import time
 import uuid
-from contextlib import contextmanager
-from typing import Iterator
 
 import boto3
 from botocore.exceptions import ClientError
@@ -30,10 +28,6 @@ SYNC_LOCK_TABLE = os.environ.get("SYNC_LOCK_TABLE", "").strip()
 LOCK_TTL_SECONDS = int(os.environ.get("SYNC_LOCK_TTL_SECONDS", "960"))
 
 _table = boto3.resource("dynamodb").Table(SYNC_LOCK_TABLE) if SYNC_LOCK_TABLE else None
-
-
-class LockNotAcquired(Exception):
-    """Raised by ``deal_lock`` when another worker holds the key (unit tests / legacy)."""
 
 
 def try_acquire(key: str) -> tuple[bool, str]:
@@ -136,15 +130,3 @@ def _release(key: str, token: str) -> None:
             logger.warning("Sync lock key=%s no longer owned at release; skipping delete", key)
             return
         logger.warning("Failed to release sync lock key=%s (will expire via TTL)", key, exc_info=True)
-
-
-@contextmanager
-def deal_lock(key: str) -> Iterator[None]:
-    """Hold the lock for *key* (raises ``LockNotAcquired`` on contention — tests only)."""
-    acquired, token = try_acquire(key)
-    if not acquired:
-        raise LockNotAcquired(key)
-    try:
-        yield
-    finally:
-        release_lock(key, token)

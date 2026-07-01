@@ -47,7 +47,7 @@ def test_lock_busy_does_not_report_batch_failure(fake_lock_table, monkeypatch):
 def test_holder_drains_pending_resync(fake_lock_table, monkeypatch):
     reconcile_calls: list[str] = []
 
-    monkeypatch.setattr(sp, "_reconcile_lock_key", lambda key: reconcile_calls.append(key) or True)
+    monkeypatch.setattr(sp, "_sync_deal_by_id", lambda key: reconcile_calls.append(key) or True)
 
     acquired, token = locks.try_acquire("deal-55")
     assert acquired

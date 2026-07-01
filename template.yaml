@@ -40,7 +40,7 @@ Parameters:
   HubSpotObjectTypeLineItem:
     Type: String
     Default: "0-8"
-    Description: HubSpot line item object type ID for webhooks (0-8 is standard CRM; 0-102 is also accepted at runtime).
+    Description: HubSpot line item object type ID for webhooks (objectTypeId).
 
   DealVenueNameProperty:
     Type: String

@@ -85,10 +85,9 @@ def _parse_comma_separated_ids(raw: str) -> tuple[str, ...]:
 # HubSpot object type IDs (webhook objectTypeId)
 HUBSPOT_OBJECT_TYPE_VENUE = _env("HUBSPOT_OBJECT_TYPE_VENUE", "2-47163024")
 HUBSPOT_OBJECT_TYPE_PAYMENT = _env("HUBSPOT_OBJECT_TYPE_PAYMENT", "0-101")
-# CRM line items: webhooks often use 0-8; some flows use 0-102 — both are accepted.
 HUBSPOT_OBJECT_TYPE_LINE_ITEM = _env("HUBSPOT_OBJECT_TYPE_LINE_ITEM", "0-8")
 HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS: frozenset[str] = frozenset(
-    {HUBSPOT_OBJECT_TYPE_LINE_ITEM, "0-8", "0-102"}
+    {HUBSPOT_OBJECT_TYPE_LINE_ITEM}
 )
 
 # Deal property internal name used to resolve venue name for invoices.

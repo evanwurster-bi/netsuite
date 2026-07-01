@@ -1,20 +1,20 @@
 # HubSpot → NetSuite (Sandbox)
 
-AWS SAM application that receives HubSpot webhooks, buffers them in SQS, and syncs deals, venues, and line items into NetSuite.
+AWS SAM application that receives HubSpot webhooks, buffers them in SQS, and syncs deals, venues, and line items into NetSuite sandbox (`3763009-sb1`).
 
 One codebase deploys per client account. Application source and non-secret configuration live in git. Credentials never enter the repository — local files for development, AWS Secrets Manager for deployed Lambdas.
+
+**Scope:** this repository targets **sandbox** environments only. Production stacks under `../production/` are out of scope for current work. Deploy configs in `samconfig accounts/` point at **reliability** stacks used for E2E validation (`hs-netsuite-sandbox-{account}-reliability`).
 
 ## What it does
 
 HubSpot sends webhooks when deals, line items, or venues change. The integration does **not** apply each webhook as a delta. It **re-reads the full current state** from HubSpot (deal + line items) and **upserts** the NetSuite invoice keyed by `externalId = HubSpot deal id`. The webhook is only a trigger; retries and duplicate deliveries converge on the same invoice.
 
-Supported flows:
-
 | Trigger | NetSuite target |
 |---------|-----------------|
 | Deal (create / property change) | Invoice create or update |
-| Line item (create / change / delete) | Reconcile parent deal invoice |
-| Venue (create / change) | NetSuite location + write-back of `netsuite_id` on the venue |
+| Line item (create / change / delete) | Reconcile parent deal invoice lines (when invoice exists) |
+| Venue (create / change) | NetSuite `location` + write-back of `netsuite_id` on the venue |
 | Payment webhooks | Acknowledged only (sync disabled) |
 
 ## Architecture
@@ -38,22 +38,20 @@ HubSpot → API Gateway (WebhookFunction) → SQS → ProcessorFunction → NetS
 
 Processor Lambda timeout: **200s**. SQS event source `MaximumConcurrency`: **2** (caps parallel NetSuite load).
 
-Deep dive on locks, retries, and idempotency: [RELIABILITY.md](RELIABILITY.md). Per-failure-mode notes: [docs/failure-scenarios/](docs/failure-scenarios/).
+Further reading: [RELIABILITY.md](RELIABILITY.md) (locks, retries, idempotency), [docs/failure-scenarios/](docs/failure-scenarios/) (per failure mode), [samconfig accounts/README.md](samconfig%20accounts/README.md) (deploy configs).
 
 ## Concurrency: lock + `pending_resync`
 
-Events for the same parent deal (including line items) share one lock key. Only one processor run reconciles that deal at a time.
+Events for the same parent deal (including line items) share one lock key. Only one processor run reconciles that deal at a time. Venue events use a separate `venue:{id}` key.
 
 | Situation | Behaviour |
 |-----------|-----------|
 | Lock free | Acquire lock → reconcile → drain pending → release lock |
 | Lock busy | Set `pending_resync = true` on the lock row → **ACK** message (no SQS retry) |
 | After reconcile | Holder runs follow-up reconciles while `consume_pending_resync` finds pending activity |
-| Lock release | Row is **deleted** from DynamoDB (do not expect `pending_resync` to remain visible after sync completes) |
+| Lock release | Row is **deleted** from DynamoDB |
 
-Log prefixes: `[coalesced]` (contention), `[resync]` (follow-up reconcile), `[rejected]` (permanent business skip), `[retry]` (transient error → SQS redrive).
-
-**Design principle:** many webhooks during a burst collapse into one or two reconciles of final state, not N full syncs and not DLQ noise from lock contention.
+Log prefixes: `[coalesced]` (contention), `[resync]` (follow-up reconcile), `[rejected]` (permanent business skip), `[retry]` (transient error → SQS redrive), `[timing]` (reconcile duration breakdown), `[lines]` (line-item filter summary).
 
 ## SQS message outcomes
 
@@ -62,24 +60,28 @@ The processor returns `batchItemFailures` (`ReportBatchItemFailures`). Each mess
 | Outcome | Meaning | SQS |
 |---------|---------|-----|
 | Returns `True` | Synced, intentional skip, or coalesced | Deleted (ACK) |
-| Returns `False` | Permanent business rejection (no contact, wrong stage, venue not found, …) | Deleted; logged `[rejected]`; reason on deal `netsuite_invoice_status` |
+| Returns `False` | Permanent business rejection (no contact, wrong stage, NetSuite 400 validation, …) | Deleted; logged `[rejected]`; reason on deal `netsuite_invoice_status` |
 | Raises exception | Transient error (NetSuite 5xx, network, HubSpot after in-process retries) | Redriven; after 5 receives → **DLQ** |
 
-Credential or config errors (e.g. HubSpot 401) also raise and follow the retry/DLQ path unless handled as a business rejection (e.g. venue search `400` → `DealInvoiceRejected`).
+**NetSuite 400** responses (e.g. invalid `salesrep`, bad field value) are treated as **permanent** rejections: the deal is stamped with `netsuite_invoice_status`, the message is ACKed, and it does **not** retry to the DLQ.
 
-## Client accounts
+HubSpot venue search **400** → `DealInvoiceRejected` (same permanent path). Credential errors (e.g. HubSpot 401) still raise and follow the retry/DLQ path.
 
-| Account | Deploy config | AWS secret |
-|---------|---------------|------------|
-| Duvall | `samconfig accounts/sandbox/duvall.toml` | `hs-netsuite/sandbox/duvall` |
-| Best Impressions | `samconfig accounts/sandbox/bestimpressions.toml` | `hs-netsuite/sandbox/bestimpressions` |
-| Rocky Top | `samconfig accounts/sandbox/rockytop.toml` | `hs-netsuite/sandbox/rockytop` |
+## Client accounts (reliability stacks)
 
-Parallel **reliability / E2E** stacks use the same template under `samconfig accounts/reliability/` (separate stack name, queue, lock table, webhook URL). See [samconfig accounts/README.md](samconfig%20accounts/README.md).
+| Account | Deploy config | Stack | Webhook (reliability) | AWS secret | Subsidiary |
+|---------|---------------|-------|------------------------|------------|------------|
+| Best Impressions | `samconfig accounts/bestimpressions.toml` | `hs-netsuite-sandbox-bestimpressions-reliability` | `https://9pofareyp2.execute-api.us-east-1.amazonaws.com/hubspot/webhook` | `hs-netsuite/sandbox/bestimpressions` | `2` |
+| Duvall | `samconfig accounts/duvall.toml` | `hs-netsuite-sandbox-duvall-reliability` | `https://1zwhwpcpgh.execute-api.us-east-1.amazonaws.com/hubspot/webhook` | `hs-netsuite/sandbox/duvall` | `4` |
+| Rocky Top | `samconfig accounts/rockytop.toml` | `hs-netsuite-sandbox-rockytop-reliability` | `https://7l5bdrcx96.execute-api.us-east-1.amazonaws.com/hubspot/webhook` | `hs-netsuite/sandbox/rockytop` | `5` |
+
+Each reliability stack has its own API Gateway URL, SQS queue, DLQ, and lock table. Secrets Manager credentials are shared with the primary sandbox account secret for that portal.
+
+Point HubSpot webhooks at the reliability URL only while validating. Switch back to the primary sandbox webhook when reliability testing is complete.
 
 ## Deploy parameters
 
-Non-secret values are passed via `samconfig accounts/*/<account>.toml` → CloudFormation parameters → Lambda env vars.
+Non-secret values are passed via `samconfig accounts/<account>.toml` → CloudFormation parameters → Lambda env vars.
 
 | SAM parameter | Lambda env var | Purpose |
 |---------------|----------------|---------|
@@ -98,7 +100,7 @@ Non-secret values are passed via `samconfig accounts/*/<account>.toml` → Cloud
 | `WebhookObjectIdFilterEnabled` | `WEBHOOK_OBJECT_ID_FILTER_ENABLED` | When true, only listed object ids are processed |
 | `WebhookObjectIdFilterValue` | `WEBHOOK_OBJECT_ID_FILTER_VALUE` | Comma-separated allowlist of HubSpot `objectId` values |
 
-Stage and venue parameters accept comma-separated lists where noted.
+Stage and venue parameters accept comma-separated lists where noted. All reliability deploys currently set `WebhookObjectIdFilterEnabled=false`.
 
 ### Venue configuration (two different objects)
 
@@ -158,7 +160,7 @@ Credential rotation takes effect on the **next cold start**. A code redeploy is 
 | Active local config | `.env` (copy from `.env.<account>`) |
 | Per-account reference | `.env.duvall`, `.env.bestimpressions`, `.env.rockytop` |
 | NetSuite private key (P-256) | `certificates/private.pem` |
-| Reference ids (not auto-loaded) | `secrets/netsuite-sandbox.json` |
+| Reference ids (not auto-loaded) | `secrets/netsuite-sandbox.json`, `secrets/hubspot-accounts.json` |
 
 `generate_token.py` reads `.env` and auto-loads `certificates/private.pem` when `NETSUITE_CERT_STRING` is unset.
 
@@ -166,7 +168,7 @@ Do **not** set `ACCOUNT_SECRET_NAME` locally unless you intend to call Secrets M
 
 ## Prerequisites
 
-- AWS SAM CLI, AWS CLI (profile with deploy + `secretsmanager:GetSecretValue`)
+- AWS SAM CLI, AWS CLI (profile `dev-cetdigit` with deploy + `secretsmanager:GetSecretValue`)
 - Python 3.14 (matches `template.yaml` runtime)
 - HubSpot private app token (CRM scopes)
 - NetSuite REST integration (OAuth 2.0 client credentials + EC P-256 certificate)
@@ -177,16 +179,19 @@ From the `sandbox/` directory:
 
 ```bash
 sam validate --lint
-
-sam build  --config-file "samconfig accounts/sandbox/duvall.toml"
-sam deploy --config-file "samconfig accounts/sandbox/duvall.toml"
+sam build  --config-file "samconfig accounts/duvall.toml"
+sam deploy --config-file "samconfig accounts/duvall.toml"
 ```
 
-Replace `duvall` with `bestimpressions` or `rockytop`. For reliability stacks:
+Replace `duvall` with `bestimpressions` or `rockytop`. Add `--no-confirm-changeset` to skip the CloudFormation prompt.
+
+Deploy all three accounts after a shared code change:
 
 ```bash
-sam build  --config-file "samconfig accounts/reliability/duvall.toml"
-sam deploy --config-file "samconfig accounts/reliability/duvall.toml"
+sam build --no-cached
+sam deploy --config-file "samconfig accounts/bestimpressions.toml" --no-confirm-changeset
+sam deploy --config-file "samconfig accounts/duvall.toml" --no-confirm-changeset
+sam deploy --config-file "samconfig accounts/rockytop.toml" --no-confirm-changeset
 ```
 
 Each stack exposes a `WebhookUrl` output — point HubSpot webhooks at the URL for the stack you are testing.
@@ -209,7 +214,7 @@ Invoke-WebRequest -Uri "REPLACE_WITH_WebhookUrl" -Method POST -ContentType "appl
 
 Expected response: `204`.
 
-Unit tests:
+Unit tests (80 tests, no live AWS / API calls):
 
 ```bash
 pip install pytest cryptography pyjwt requests boto3 python-dotenv
@@ -246,7 +251,7 @@ Stages not listed in either variable are ignored.
 
 #### Per-account stage configuration
 
-Configured in each account's `samconfig accounts/sandbox/<account>.toml` (mirrored under `reliability/`):
+Configured in each account's `samconfig accounts/<account>.toml`:
 
 | Account | Create (`HubSpotDealStageCreateId`) | Update (`HubSpotDealStageUpdateId`) |
 |---------|-------------------------------------|-------------------------------------|
@@ -256,24 +261,51 @@ Configured in each account's `samconfig accounts/sandbox/<account>.toml` (mirror
 
 To add or change stages, edit the comma-separated values in the account's `parameter_overrides` and redeploy.
 
-#### Additional invoice rules
+#### Invoice reconcile flow
 
-- Billing contact: HubSpot association label `Billing`, else first associated contact.
-- Customer: NetSuite lookup by contact email; must belong to deploy subsidiary (`NETSUITE_SUBSIDIARY_ID`).
-- Venue: read name from `DEAL_VENUE_NAME_PROPERTY` on the deal → CRM search on venue object using `HUBSPOT_VENUE_NAME_SEARCH_PROPERTIES` → NetSuite `location`.
+When a deal passes the stage gate, `reconcile_deal_invoice` runs:
+
+1. **Customer** — billing contact (association label `Billing`, else first associated contact) → NetSuite customer lookup by contact **email**
+2. **Subsidiary** — customer must be assigned to deploy subsidiary (`NETSUITE_SUBSIDIARY_ID`)
+3. **Sales rep** — HubSpot **deal owner** (`hubspot_owner_id`) → owner email → NetSuite employee → invoice `salesrep` (not the associated contact)
+4. **Venue** — deal property `DEAL_VENUE_NAME_PROPERTY` → HubSpot venue search → NetSuite `location` (get or create)
+5. **Line items** — fetch all deal lines, filter, batch SKU lookup, upsert invoice with one row per eligible line
+6. **Write-back** — `netsuite_invoice_number`, `netsuite_invoice_status`, `netsuite_invoice_last_modified_date` on the deal
+
+If NetSuite rejects the invoice with **400**, the error detail is written to `netsuite_invoice_status` and the message is not retried.
+
+#### Observability (CloudWatch)
+
+| Log prefix | When |
+|------------|------|
+| `[deal] - Reconcile started` | Reconcile begins |
+| `[lines] - Fetching, analyzing and validating line items` | Before line-item fetch + filter |
+| `[lines] - Filter summary` | After filters: `total`, `mapped`, `skipped`, `not_found`, `skip_reasons`, `missing_skus` |
+| `[timing] reconcile` | End of reconcile: per-step seconds + total |
+| `[deal] - Reconcile complete` | Success with invoice number and line count |
+| `[rejected]` | Permanent skip (lambda_handler) |
+| `[retry]` | Transient failure → SQS redrive |
 
 ### Line items
 
-Deal line items are loaded with **one associations call + one HubSpot batch read** (`get_line_item_details_batch`), **consolidated by SKU** (quantities and amounts summed, rate recalculated), then validated and resolved with **one SuiteQL batch lookup** per deal:
+The processor loads **all** deal line items efficiently:
+
+1. One HubSpot associations call (deal → line items)
+2. One or more `batch/read` calls (100 ids per request)
+3. In-memory eligibility filters
+4. One NetSuite SuiteQL batch lookup (`itemid IN (...)`)
+5. One invoice upsert with **one NetSuite row per eligible HubSpot line** (duplicate SKUs are kept as separate rows)
 
 | Rule | Action |
 |------|--------|
 | `subcategory = Owned Equipment` and `amount <= 0` | Skipped |
 | SKU missing or not starting with `3` | Skipped |
-| SKU passes filters but not found in NetSuite | Logged as error, skipped for invoice |
-| SKU passes filters and found | One consolidated invoice line per SKU |
+| SKU passes filters but not found in NetSuite | Omitted from invoice; counted in `not_found` / `missing_skus` in filter summary |
+| SKU passes filters and found | One NetSuite invoice line per eligible HubSpot line |
 
-CloudWatch logs use the `[lines]` prefix for consolidation and filter summaries.
+Line-item webhooks resolve the parent deal via HubSpot **v4 associations** (`GET /crm/v4/objects/line_items/{id}/associations/deals`). If no parent deal is found, the event is skipped.
+
+When a line-item webhook fires and a NetSuite invoice already exists, only invoice lines are updated (`PATCH` with `replace=item`).
 
 ### Payments
 
@@ -287,14 +319,15 @@ Payment sync is **disabled**. Payment webhooks are acknowledged immediately with
 | `400 Bad Request` on NetSuite `/oauth2/v1/token` | Wrong or malformed `netsuite_cert_string` in secret; verify with `generate_token.py` locally |
 | OAuth works locally but fails in Lambda | Secret out of date, or warm container still on old cached secret — wait for cold start after `put-secret-value` |
 | `[coalesced] lock busy` in logs | Normal under burst traffic; holder will follow-up reconcile if needed |
-| `pending_resync` not visible in DynamoDB | Lock row deleted on release, or flag cleared by holder before you refresh — see [Concurrency](#concurrency-lock--pending_resync) |
 | Messages in DLQ | Persistent exception after 5 receives — inspect message body and `[retry]` logs |
 | `[rejected]` in logs | Permanent business rule failure — check `netsuite_invoice_status` on the deal |
+| `Not created: Invalid Field Value ... salesrep` | Deal owner maps to a NetSuite employee that is not a valid sales rep for the subsidiary; fix owner or employee in HubSpot/NetSuite |
+| `No parent deal resolved for objectId=...` | Line-item webhook with no deal association (v4 API returned none) |
 | HubSpot venue search `400` | Wrong `HubSpotVenueNameSearchProperties` or `HubSpotObjectTypeVenue` for that portal |
 | `Invalid Field Value ... location` | Subsidiary / location mismatch in NetSuite |
-| `Record has been changed` | Concurrent invoice update (lock should prevent this in normal operation) |
 | Invoice sync skipped | Deal stage not in create/update config, `prior_netsuite_invoice != no`, or update stage with no existing NetSuite invoice |
 | OAuth fails locally (`secp521r1`) | Private key must be P-256 (`secp256r1`) for ES256 |
+| Invoice created with fewer lines than HubSpot | Some SKUs failed filters or were not found in NetSuite — check `[lines] Filter summary` |
 
 ## Security
 
@@ -307,10 +340,12 @@ Payment sync is **disabled**. Payment webhooks are acknowledged immediately with
 
 ```text
 template.yaml              SAM infrastructure
-lambda_functions/          Webhook + processor handlers
+lambda_functions/
+  hubspot_webhook/         API Gateway → SQS enqueue
+  hubspot_processor/       SQS consumer, reconcile, locks
 lambda_layers/             Shared Python dependencies
-samconfig accounts/        Per-account deploy parameters (sandbox + reliability)
-tests/                     Unit tests (no live AWS / API calls)
+samconfig accounts/        Per-account SAM deploy configs (see README there)
+tests/                     Unit tests (80 tests; no live AWS / API calls)
 docs/failure-scenarios/    Failure-mode design notes
 RELIABILITY.md             Lock, retry, and idempotency register
 ```

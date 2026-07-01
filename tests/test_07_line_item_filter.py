@@ -1,4 +1,4 @@
-"""Line-item consolidation, filters, and NetSuite SKU batch lookups."""
+"""Line-item filters and NetSuite SKU batch lookups."""
 
 import sqs_processor as sp
 
@@ -62,7 +62,7 @@ def test_line_items_filtered_before_netsuite_lookup(monkeypatch):
     assert result[0]["amount"] == 25
 
 
-def test_line_items_same_sku_consolidated_before_validation(monkeypatch):
+def test_line_items_same_sku_kept_as_separate_rows(monkeypatch):
     batch_calls: list[list[str]] = []
 
     def fake_batch(skus: list[str]):
@@ -104,13 +104,16 @@ def test_line_items_same_sku_consolidated_before_validation(monkeypatch):
 
     result = sp.process_deal_lineitems_change(items)
     assert batch_calls == [["312345"]]
-    assert len(result) == 1
-    assert result[0]["quantity"] == 6
-    assert result[0]["amount"] == 60
-    assert result[0]["rate"] == 10
+    assert len(result) == 3
+    assert result[0]["quantity"] == 2
+    assert result[0]["amount"] == 20
+    assert result[1]["quantity"] == 3
+    assert result[1]["amount"] == 30
+    assert result[2]["quantity"] == 1
+    assert result[2]["amount"] == 10
 
 
-def test_line_items_batch_lookup_one_line_per_sku(monkeypatch):
+def test_line_items_batch_lookup_one_line_per_hubspot_row(monkeypatch):
     batch_calls: list[list[str]] = []
 
     def fake_batch(skus: list[str]):
@@ -155,26 +158,14 @@ def test_line_items_batch_lookup_one_line_per_sku(monkeypatch):
 
     result = sp.process_deal_lineitems_change(items)
     assert batch_calls == [["3001", "3003"]]
-    assert len(result) == 2
+    assert len(result) == 3
     assert result[0]["item"]["id"] == "ns-1"
-    assert result[0]["quantity"] == 3
-    assert result[0]["amount"] == 30
-    assert result[1]["item"]["id"] == "ns-3"
-
-
-def test_consolidate_line_items_by_sku_sums_quantity_and_recalculates_rate():
-    items = [
-        {"properties": {"hs_sku": "3001", "quantity": 2, "amount": 20, "price": 10}},
-        {"properties": {"hs_sku": "3001", "quantity": 3, "amount": 30, "price": 10}},
-    ]
-
-    consolidated = sp._consolidate_line_items_by_sku(items)
-    assert len(consolidated) == 1
-    props = consolidated[0]["properties"]
-    assert props["hs_sku"] == "3001"
-    assert props["quantity"] == 5
-    assert props["amount"] == 50
-    assert props["price"] == 10
+    assert result[0]["quantity"] == 1
+    assert result[0]["amount"] == 10
+    assert result[1]["item"]["id"] == "ns-1"
+    assert result[1]["quantity"] == 2
+    assert result[1]["amount"] == 20
+    assert result[2]["item"]["id"] == "ns-3"
 
 
 def test_fetch_deal_line_item_details_uses_batch(monkeypatch):

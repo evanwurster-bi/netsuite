@@ -372,14 +372,37 @@ class HubSpotClient:
         
         return response.json()
     
-    def get_line_item_deal_id(self, line_item_id: str, api_version: str = None) -> str | None:
-        """Return only the parent deal id for a line item (no deal fetch)."""
-        base_url = self._get_base_url(api_version)
-        url = f'{base_url}/objects/line_items/{line_item_id}/associations/deals'
-        response = self._request("GET", url)
-
-        deals = response.json().get('results', [])
-        return str(deals[0]['id']) if deals else None
+    def get_line_item_deal_id(self, line_item_id: str) -> str | None:
+        url = (
+            f"{self._get_base_url('v4')}"
+            f"/objects/line_items/{line_item_id}/associations/deals"
+        )
+        response = requests.get(url, headers=self.headers)
+        path = _hubspot_path_for_log(url)
+        if response.status_code == 404:
+            logger.info("[HubSpot] GET %s -> 404", path)
+            return None
+        if response.ok:
+            logger.info("[HubSpot] GET %s -> %s", path, response.status_code)
+        else:
+            preview = (response.text or "")[:400].replace("\n", " ")
+            logger.error(
+                "[HubSpot] GET %s -> %s %s",
+                path,
+                response.status_code,
+                preview,
+            )
+            response.raise_for_status()
+        results = response.json().get("results", [])
+        if not results:
+            return None
+        raw = results[0].get("toObjectId")
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        return text
 
     def get_deal_contacts(self, deal_id: str, api_version: str = None) -> List[Dict[str, Any]]:
         """Fetch the contacts associated with a deal."""
@@ -518,7 +541,6 @@ class HubSpotClient:
                 'item': {
                     'id': line_item.get('item', {}).get('id')
                 },
-                # 'line': 1,
                 'quantity': line_item.get('quantity'),
                 'amount': line_item.get('amount'),
                 'description': line_item.get('description'),
@@ -528,11 +550,7 @@ class HubSpotClient:
             if line_item.get('line'):
                 item['line'] = int(line_item.get('line'))
             netsuite_invoice['item']['items'].append(item)
-            
-            
-        
-        
-        
+
         return netsuite_invoice
     
     def validate_webhook_payload(self, payload: Dict[str, Any]) -> tuple[bool, str, str]:

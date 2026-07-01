@@ -9,6 +9,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import requests
+
 from config import (
     DEAL_VENUE_NAME_PROPERTY,
     HUBSPOT_DEAL_STAGE_CREATE_IDS,
@@ -26,7 +28,7 @@ from locks import (
     release_lock,
     try_acquire,
 )
-from netsuite_auth import NetSuiteAuth
+from netsuite_auth import NetSuiteAuth, netsuite_client_error_detail
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -76,6 +78,39 @@ def _sleep_between_api_calls() -> None:
         time.sleep(_API_CALL_DELAY_SECONDS)
 
 
+class _ReconcileTimer:
+    """Record per-step elapsed time and emit one summary line at the end."""
+
+    def __init__(self, deal_id: str) -> None:
+        self.deal_id = deal_id
+        self._started = time.monotonic()
+        self._steps: List[Tuple[str, float]] = []
+        self._open_step: Optional[str] = None
+        self._open_started: Optional[float] = None
+
+    def mark(self, step: str) -> None:
+        now = time.monotonic()
+        if self._open_step is not None and self._open_started is not None:
+            self._steps.append((self._open_step, now - self._open_started))
+        self._open_step = step
+        self._open_started = now
+
+    def finish(self) -> None:
+        now = time.monotonic()
+        if self._open_step is not None and self._open_started is not None:
+            self._steps.append((self._open_step, now - self._open_started))
+            self._open_step = None
+            self._open_started = None
+        total = now - self._started
+        breakdown = ", ".join(f"{name}={elapsed:.2f}s" for name, elapsed in self._steps)
+        logger.info(
+            "[timing] reconcile deal_id=%s total=%.2fs (%s)",
+            self.deal_id,
+            total,
+            breakdown,
+        )
+
+
 def _fetch_deal_line_item_details(deal_id: str) -> List[Dict[str, Any]]:
     """One associations call + one batch read for all line items on a deal."""
     association_rows = hubspot.get_deal_line_items(deal_id)
@@ -123,10 +158,7 @@ def _set_deal_invoice_status(deal_id: str, status: str) -> None:
 
 
 def _should_process_object_id(webhook_data: Dict[str, Any]) -> bool:
-    """
-    Optionally process only webhook items matching configured objectId value(s).
-    When the filter is disabled, all messages are processed.
-    """
+    """When enabled, process only webhooks whose objectId is in the configured allowlist."""
     if not WEBHOOK_OBJECT_ID_FILTER_ENABLED:
         return True
 
@@ -165,11 +197,8 @@ def _deal_invoice_sync_properties() -> List[str]:
         "dealstage",
         "dealname",
         "event_type",
-        "amount",
-        "venue",
         "event_start_date_and_time",
         DEAL_VENUE_NAME_PROPERTY,
-        "venue_netsuite_id",
         "hubspot_owner_id",
         "production_fee",
         "netsuite_est_guest_count",
@@ -252,35 +281,6 @@ def _deal_invoice_gate(
     return True
 
 
-def _should_process_deal_invoice(webhook_data: Dict[str, Any]) -> bool:
-    """
-    Gate deal-to-invoice processing by deal stage (standalone fetch for tests/tools).
-
-    The production path loads the deal once in ``process_deal_to_invoice`` and reuses it in
-    ``reconcile_deal_invoice``; this helper remains for unit tests of the gate rules.
-    """
-    deal_id = str(webhook_data.get("objectId", "")).strip()
-    if not deal_id:
-        logger.warning(
-            "[deal] - Missing objectId while evaluating deal stage; skipping invoice sync"
-        )
-        return False
-
-    hubspot_deal = hubspot.get_deal(
-        deal_id,
-        properties=["prior_netsuite_invoice", "dealstage"],
-    )
-    if not hubspot_deal:
-        logger.warning(
-            "[deal] - Could not load deal %s to evaluate deal stage; skipping invoice sync",
-            deal_id,
-        )
-        return False
-
-    netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
-    return _deal_invoice_gate(deal_id, hubspot_deal, netsuite_invoice_id)
-
-
 def _is_venue_event(webhook_data: Dict[str, Any]) -> bool:
     """Return True when webhook belongs to HubSpot venue object events."""
     subscription_type = webhook_data.get("subscriptionType", "")
@@ -318,78 +318,19 @@ def _parse_line_quantity(raw: Any) -> float:
         return 0.0
 
 
-def _consolidate_line_items_by_sku(
-    hubspot_line_items: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Group HubSpot lines by ``hs_sku`` and build one synthetic row per SKU."""
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    group_order: List[str] = []
-
-    for hubspot_line_item in hubspot_line_items:
-        props = hubspot_line_item.get("properties") or {}
-        sku = str(props.get("hs_sku") or "").strip()
-        if sku not in groups:
-            groups[sku] = []
-            group_order.append(sku)
-        groups[sku].append(hubspot_line_item)
-
-    consolidated: List[Dict[str, Any]] = []
-    for sku in group_order:
-        items = groups[sku]
-        total_quantity = 0.0
-        total_amount = 0.0
-        name = ""
-        subcategory = ""
-
-        for hubspot_line_item in items:
-            props = hubspot_line_item.get("properties") or {}
-            if not name:
-                name = str(props.get("name") or "").strip()
-            if not subcategory:
-                subcategory = str(props.get("subcategory") or "").strip()
-            total_quantity += _parse_line_quantity(props.get("quantity"))
-            total_amount += _parse_line_amount(props.get("amount"))
-
-        rate = total_amount / total_quantity if total_quantity else 0.0
-        logger.info(
-            "[lines] - Consolidated sku=%s from %s HubSpot line(s) qty=%s amount=%s rate=%s",
-            sku or "missing",
-            len(items),
-            total_quantity,
-            total_amount,
-            rate,
-        )
-        consolidated.append(
-            {
-                "properties": {
-                    "hs_sku": sku,
-                    "name": name,
-                    "quantity": total_quantity,
-                    "amount": total_amount,
-                    "price": rate,
-                    "subcategory": subcategory,
-                }
-            }
-        )
-
-    return consolidated
-
-
 def _parse_hubspot_line_item(
     hubspot_line_item: Dict[str, Any],
     skip_sub_category: str,
-) -> Tuple[str, str, float, Dict[str, Any], Optional[str]]:
+) -> Tuple[str, float, Dict[str, Any], Optional[str]]:
     """Parse HubSpot line props; return a skip reason or None if eligible for NetSuite lookup."""
     props = hubspot_line_item.get("properties") or {}
     current_sub_category = str(props.get("subcategory") or "").strip().lower()
     hubspot_item_sku = str(props.get("hs_sku") or "").strip()
-    hubspot_item_name = str(props.get("name") or "").strip()
     line_amount = _parse_line_amount(props.get("amount"))
 
     if current_sub_category == skip_sub_category and line_amount <= 0:
         return (
             hubspot_item_sku,
-            hubspot_item_name,
             line_amount,
             props,
             f"subcategory={HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY} amount<=0",
@@ -398,71 +339,45 @@ def _parse_hubspot_line_item(
     if not hubspot_item_sku.startswith("3"):
         return (
             hubspot_item_sku,
-            hubspot_item_name,
             line_amount,
             props,
             "sku_missing_or_not_starting_with_3",
         )
 
-    return hubspot_item_sku, hubspot_item_name, line_amount, props, None
+    return hubspot_item_sku, line_amount, props, None
 
 
 def process_deal_lineitems_change(
     hubspot_line_items: List[Dict[str, Any]],
 ) -> Union[List[Dict[str, Any]], bool]:
-    """Map HubSpot lines to NetSuite invoice rows; consolidate by SKU, then validate."""
+    """Filter each HubSpot line, resolve SKUs in NetSuite, return invoice item rows."""
     try:
         total = len(hubspot_line_items)
-        logger.info("[lines] - Evaluating %s HubSpot line item(s)", total)
-        consolidated_items = _consolidate_line_items_by_sku(hubspot_line_items)
-        logger.info("[lines] - Consolidated to %s SKU group(s)", len(consolidated_items))
         skip_sub_category = str(HUBSPOT_LINE_ITEM_SKIP_SUB_CATEGORY or "").strip().lower()
-        eligible: List[Tuple[str, str, float, Dict[str, Any]]] = []
-        skipped: List[Tuple[str, str, str]] = []
+        eligible: List[Tuple[str, float, Dict[str, Any]]] = []
         skip_counts: Dict[str, int] = {}
 
-        for consolidated_line_item in consolidated_items:
-            sku, name, amount, props, skip_reason = _parse_hubspot_line_item(
-                consolidated_line_item,
+        for hubspot_line_item in hubspot_line_items:
+            sku, amount, props, skip_reason = _parse_hubspot_line_item(
+                hubspot_line_item,
                 skip_sub_category,
             )
             if skip_reason:
-                skipped.append((sku or "missing", name or "missing", skip_reason))
                 skip_counts[skip_reason] = skip_counts.get(skip_reason, 0) + 1
                 continue
-            eligible.append((sku, name, amount, props))
-
-        logger.info(
-            "[lines] - Filter summary total=%s eligible=%s skipped=%s by_reason=%s",
-            total,
-            len(eligible),
-            len(skipped),
-            skip_counts,
-        )
-        for sku, name, skip_reason in skipped:
-            logger.info(
-                "[lines] - Skipped sku=%s name=%s reason=%s",
-                sku,
-                name,
-                skip_reason,
-            )
+            eligible.append((sku, amount, props))
 
         final_line_items: List[Dict[str, Any]] = []
-        not_found = 0
-        unique_skus = list(dict.fromkeys(sku for sku, _, _, _ in eligible))
+        missing_skus: List[str] = []
+        unique_skus = list(dict.fromkeys(sku for sku, _, _ in eligible))
         sku_to_item = netsuite.search_items_by_sku_batch(unique_skus)
         _sleep_between_api_calls()
 
-        for hubspot_item_sku, hubspot_item_name, line_amount, props in eligible:
+        for hubspot_item_sku, line_amount, props in eligible:
             netsuite_item = sku_to_item.get(hubspot_item_sku)
 
             if not netsuite_item:
-                not_found += 1
-                logger.error(
-                    "[lines] - NetSuite item not found for sku=%s name=%s",
-                    hubspot_item_sku,
-                    hubspot_item_name or "missing",
-                )
+                missing_skus.append(hubspot_item_sku)
                 continue
 
             netsuite_item_id = netsuite_item.get("id")
@@ -475,13 +390,21 @@ def process_deal_lineitems_change(
             }
             final_line_items.append(line)
 
-        if not_found:
-            logger.info(
-                "[lines] - NetSuite lookup summary eligible=%s mapped=%s not_found=%s",
-                len(eligible),
-                len(final_line_items),
-                not_found,
-            )
+        skipped = total - len(eligible)
+        missing_preview: List[str] = missing_skus[:10]
+        if len(missing_skus) > 10:
+            missing_preview.append(f"+{len(missing_skus) - 10} more")
+
+        logger.info(
+            "[lines] - Filter summary total=%s mapped=%s skipped=%s not_found=%s "
+            "skip_reasons=%s missing_skus=%s",
+            total,
+            len(final_line_items),
+            skipped,
+            len(missing_skus),
+            skip_counts,
+            missing_preview,
+        )
 
         return final_line_items
 
@@ -570,14 +493,17 @@ def reconcile_deal_invoice(
     is absent and updates it if it exists.
 
     Returns ``True`` when handled (synced, or a recorded business rejection) and ``False``
-    for a permanent rejection. Transient errors propagate so the caller can retry.
+    for a permanent rejection. NetSuite 400 validation errors are recorded on the deal and
+    acked without SQS retry. Transient errors (5xx, network) propagate so the caller can retry.
     """
+    timer = _ReconcileTimer(deal_id)
     try:
-        logger.info("reconcile_deal_invoice: deal_id=%s", deal_id)
+        logger.info("[deal] - Reconcile started deal_id=%s", deal_id)
 
         def _set_invoice_status(reason: str) -> None:
             _set_deal_invoice_status(deal_id, reason)
 
+        timer.mark("customer")
         hubspot_contact = hubspot.get_deal_billing_contact_or_default_contact(deal_id)
         if not hubspot_contact:
             logger.error("No billing/default contact for deal %s", deal_id)
@@ -599,6 +525,7 @@ def reconcile_deal_invoice(
 
         netsuite_customer_id = netsuite_customer.get("id")
 
+        timer.mark("subsidiaries")
         customer_subsidiaries = netsuite.get_customer_subsidiaries(netsuite_customer_id)
         _sleep_between_api_calls()
         allowed_subsidiary_ids = {
@@ -625,11 +552,8 @@ def reconcile_deal_invoice(
             return False
 
         netsuite_customer_subsidiary_id = NETSUITE_SUBSIDIARY_ID
-        logger.info(
-            "[subsidiary-debug] resolved netsuite_customer_subsidiary_id=%s",
-            netsuite_customer_subsidiary_id,
-        )
 
+        timer.mark("deal")
         if hubspot_deal is None:
             hubspot_deal = hubspot.get_deal(deal_id, properties=_deal_invoice_sync_properties())
         if not hubspot_deal:
@@ -639,8 +563,7 @@ def reconcile_deal_invoice(
             "netsuite_invoice_number", ""
         )
 
-        hubspot_deal_line_items_details = _fetch_deal_line_item_details(deal_id)
-
+        timer.mark("sales_rep")
         netsuite_sales_rep_id: Optional[str] = None
         hubspot_owner_id = (hubspot_deal.get("properties") or {}).get("hubspot_owner_id")
         if hubspot_owner_id:
@@ -655,13 +578,13 @@ def reconcile_deal_invoice(
                         if netsuite_employee:
                             netsuite_sales_rep_id = netsuite_employee.get("id")
                             logger.info(
-                                "Mapped HubSpot owner %s to NetSuite employee %s",
+                                "[deal] - Sales rep mapped owner=%s employee=%s",
                                 owner_email,
                                 netsuite_sales_rep_id,
                             )
                         else:
                             logger.warning(
-                                "No NetSuite employee for owner email %s",
+                                "[deal] - No NetSuite employee for owner email %s",
                                 owner_email,
                             )
                     else:
@@ -669,12 +592,14 @@ def reconcile_deal_invoice(
                 else:
                     logger.warning("HubSpot owner %s not found", hubspot_owner_id)
             except Exception:
-                logger.exception("Error resolving sales rep from deal owner")
+                logger.exception("[deal] - Sales rep resolution failed for deal %s", deal_id)
 
+        timer.mark("invoice_lookup")
         if netsuite_invoice_id is None:
             netsuite_invoice_id = netsuite.get_invoice_by_deal_id(deal_id)
         _sleep_between_api_calls()
 
+        timer.mark("venue")
         venue_name_prop = (hubspot_deal.get("properties") or {}).get(
             DEAL_VENUE_NAME_PROPERTY, ""
         )
@@ -725,11 +650,16 @@ def reconcile_deal_invoice(
                 ],
             )
         ).strip()
-        
-        logger.debug("hubspot_venue: %s", hubspot_venue)
+
         netsuite_venue = netsuite.get_or_create_venue(hubspot_venue_name, hubspot_venue.get("id"))
         netsuite_venue_id = netsuite_venue.get("id")
 
+        timer.mark("line_items")
+        logger.info(
+            "[lines] - Fetching, analyzing and validating line items for deal %s",
+            deal_id,
+        )
+        hubspot_deal_line_items_details = _fetch_deal_line_item_details(deal_id)
         netsuite_line_items = process_deal_lineitems_change(hubspot_deal_line_items_details)
         if netsuite_line_items is False:
             _set_invoice_status("Not created: line item mapping failed")
@@ -762,6 +692,7 @@ def reconcile_deal_invoice(
             _set_invoice_status("Not created: no eligible line items after filters")
             return True
 
+        timer.mark("invoice_upsert")
         netsuite_invoice = hubspot.map_to_netsuite_format(
             hubspot_deal,
             netsuite_customer_id,
@@ -770,7 +701,6 @@ def reconcile_deal_invoice(
             netsuite_line_items,
         )
 
-        logger.debug("netsuite_invoice: %s", netsuite_invoice)
         if netsuite_sales_rep_id:
             netsuite_invoice["salesrep"] = {"id": int(netsuite_sales_rep_id)}
 
@@ -786,6 +716,8 @@ def reconcile_deal_invoice(
             raise RuntimeError(f"Invoice upsert did not succeed for deal {deal_id}")
         # Direct GET by internal id is strongly consistent, so no read-back lag here.
         netsuite_invoice_number = netsuite.get_invoice_number(created_invoice_id)
+
+        timer.mark("writeback")
         invoice_status = "Invoice Modified" if existing_invoice_number else "Invoice created"
         hubspot.update_deal_properties(
             deal_id,
@@ -796,10 +728,11 @@ def reconcile_deal_invoice(
             },
         )
         logger.info(
-            "[deal] - Set netsuite_invoice_number=%s netsuite_invoice_status=%s on deal %s",
+            "[deal] - Reconcile complete deal_id=%s invoice=%s status=%s lines=%s",
+            deal_id,
             netsuite_invoice_number,
             invoice_status,
-            deal_id,
+            len(netsuite_line_items),
         )
         return True
 
@@ -808,9 +741,25 @@ def reconcile_deal_invoice(
         _set_deal_invoice_status(deal_id, str(exc))
         return False
 
+    except requests.exceptions.HTTPError as exc:
+        response = exc.response
+        if response is not None:
+            detail = netsuite_client_error_detail(response)
+            if detail is not None:
+                status = f"Not created: {detail}"
+                _set_deal_invoice_status(deal_id, status)
+                logger.warning(
+                    "NetSuite rejected invoice for deal %s: %s", deal_id, detail
+                )
+                return False
+        logger.exception("reconcile_deal_invoice failed for deal %s", deal_id)
+        raise
+
     except Exception:
         logger.exception("reconcile_deal_invoice failed for deal %s", deal_id)
         raise
+    finally:
+        timer.finish()
 
 
 def process_payment(webhook_data: Dict[str, Any]) -> bool:
@@ -960,6 +909,11 @@ def process_line_item(webhook_data: Dict[str, Any]) -> bool:
             )
             return True
 
+        line_items_started = time.monotonic()
+        logger.info(
+            "[lines] - Fetching, analyzing and validating line items for deal %s",
+            deal_id,
+        )
         hubspot_line_items = _fetch_deal_line_item_details(deal_id)
         final_line_items = process_deal_lineitems_change(hubspot_line_items)
         if final_line_items is False:
@@ -967,9 +921,20 @@ def process_line_item(webhook_data: Dict[str, Any]) -> bool:
 
         if final_line_items:
             netsuite.update_invoice_line_items(netsuite_invoice_id, final_line_items)
-            logger.info("Updated NetSuite invoice %s line items", netsuite_invoice_id)
+            logger.info(
+                "[line_item] - Updated invoice %s deal_id=%s lines=%s elapsed=%.2fs",
+                netsuite_invoice_id,
+                deal_id,
+                len(final_line_items),
+                time.monotonic() - line_items_started,
+            )
         else:
-            logger.warning("No line items to update for invoice %s", netsuite_invoice_id)
+            logger.warning(
+                "[line_item] - No lines to update invoice=%s deal_id=%s elapsed=%.2fs",
+                netsuite_invoice_id,
+                deal_id,
+                time.monotonic() - line_items_started,
+            )
 
         return True
 
@@ -1005,8 +970,6 @@ def _resolve_lock_key(webhook_data: Dict[str, Any]) -> Optional[str]:
 
     if subscription_type in ("object.creation", "object.propertyChange"):
         object_type = webhook_data.get("objectTypeId")
-        if object_type == HUBSPOT_OBJECT_TYPE_PAYMENT:
-            return None
         if object_type == HUBSPOT_OBJECT_TYPE_VENUE:
             return f"venue:{object_id}"
         if object_type in HUBSPOT_LINE_ITEM_OBJECT_TYPE_IDS:
@@ -1030,9 +993,12 @@ def process_webhook_message(webhook_data: Dict[str, Any]) -> bool:
     lock_key = _resolve_lock_key(webhook_data)
     if not lock_key:
         logger.info(
-            "No parent deal resolved for objectId=%s subscriptionType=%s; skipping",
+            "No parent deal resolved for objectId=%s subscriptionType=%s objectTypeId=%s "
+            "propertyName=%s; skipping",
             webhook_data.get("objectId"),
             webhook_data.get("subscriptionType"),
+            webhook_data.get("objectTypeId"),
+            webhook_data.get("propertyName"),
         )
         return True
 

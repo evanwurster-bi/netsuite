@@ -20,6 +20,32 @@ def _netsuite_path_for_log(url: str) -> str:
     return url
 
 
+def netsuite_client_error_detail(response: requests.Response) -> Optional[str]:
+    """Return a human-readable NetSuite error for HTTP 400, or None for other statuses."""
+    if response.status_code != 400:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    details = body.get("o:errorDetails")
+    if details is None:
+        details = body.get("errorDetails")
+    if details:
+        parts: List[str] = []
+        for item in details:
+            if isinstance(item, dict):
+                detail = item.get("detail")
+                if detail:
+                    parts.append(str(detail))
+        if parts:
+            return "; ".join(parts)
+    text = (response.text or "").strip()
+    if text:
+        return text[:400]
+    return "NetSuite rejected the request (400)"
+
+
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     """Parse a numeric ``Retry-After`` header (seconds); HTTP-date form is ignored.
 
@@ -476,14 +502,14 @@ class NetSuiteAuth:
                     matched[itemid] = row
 
         missing = [sku for sku in normalized if sku not in matched]
-        logger.info(
+        logger.debug(
             "[NetSuite] Batch item lookup requested=%s matched=%s missing=%s",
             len(normalized),
             len(matched),
             len(missing),
         )
         if missing:
-            logger.warning("[NetSuite] Batch item lookup missing skus=%s", missing)
+            logger.debug("[NetSuite] Batch item lookup missing skus=%s", missing)
         return matched
         
     def update_invoice_line_items(self, invoice_id: str, line_items: List[Dict[str, Any]]) -> Dict[str, Any]:

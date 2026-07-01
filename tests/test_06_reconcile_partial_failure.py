@@ -7,6 +7,7 @@ we can drive it to the final HubSpot writeback and assert what happens when step
 """
 
 import pytest
+import requests
 
 import sqs_processor as sp
 from hubspot import DealInvoiceRejected
@@ -161,6 +162,49 @@ def test_mapping_rejection_returns_false_and_sets_status(wired, monkeypatch):
     assert statuses == [
         "Not synced: netsuite_est_guest_count must be a whole number (got '101.5')"
     ]
+
+
+def test_netsuite_400_rejection_returns_false_and_sets_status(wired, monkeypatch):
+    fake_hs, fake_ns = wired
+    statuses: list[str] = []
+    monkeypatch.setattr(
+        sp,
+        "_set_deal_invoice_status",
+        lambda deal_id, status: statuses.append(status),
+    )
+
+    def reject_invoice(*_args, **_kwargs):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = (
+            b'{"o:errorDetails":[{"detail":"Invalid Field Value 22175 for the following field: salesrep.","o:errorCode":"USER_ERROR"}]}'
+        )
+        raise requests.exceptions.HTTPError(response=response)
+
+    fake_ns.create_or_update_invoice = reject_invoice
+
+    assert sp.reconcile_deal_invoice("123") is False
+    assert fake_hs.writeback_calls == 0
+    assert len(statuses) == 1
+    assert statuses[0].startswith("Not created:")
+    assert "22175" in statuses[0]
+    assert "salesrep" in statuses[0]
+
+
+def test_netsuite_502_still_raises_for_retry(wired):
+    fake_hs, fake_ns = wired
+
+    def fail_invoice(*_args, **_kwargs):
+        response = requests.Response()
+        response.status_code = 502
+        response._content = b"Bad Gateway"
+        raise requests.exceptions.HTTPError(response=response)
+
+    fake_ns.create_or_update_invoice = fail_invoice
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        sp.reconcile_deal_invoice("123")
+    assert fake_hs.writeback_calls == 0
 
 
 def test_search_index_lag_does_not_stick_the_message(wired, monkeypatch):
